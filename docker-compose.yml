@@ -1,0 +1,8 @@
+services:
+  rppg:
+    build: .
+    image: rppg-pipeline:py311
+    container_name: rppg
+    volumes:
+      - ./:/app
+    command: ["python", "rppg.py"]
