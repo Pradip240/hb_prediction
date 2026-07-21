@@ -1,8 +1,64 @@
 services:
-  rppg:
-    build: .
-    image: rppg-pipeline:py311
-    container_name: rppg
+  segmentation:
+    image: rppg-segmentation
+    container_name: rppg-segmentation
     volumes:
-      - ./:/app
-    command: ["python", "rppg.py"]
+      - ./data:/data:ro
+      - ./output:/output
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: ["--input-dir", "/data/videos", "--output-dir", "/output/seg", "--device", "cuda"]
+
+  landmarks:
+    image: rppg-landmarks
+    container_name: rppg-landmarks
+    volumes:
+      - ./data:/data:ro
+      - ./output:/output
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_DRIVER_CAPABILITIES=graphics,compute,utility
+    command: ["--input-dir", "/data/videos", "--output-dir", "/output/landmarks"]
+
+  # signal_extraction:
+  #   image: rppg-signal-extraction
+  #   container_name: rppg-signal-extraction
+  #   volumes:
+  #     - ./data:/data:ro
+  #     - ./output:/output
+  #   command: ["--video-dir", "/data/videos", "--seg-dir", "/output/seg",
+  #             "--landmarks-dir", "/output/landmarks", "--output-dir", "/output/signals"]
+
+  # visualization:
+  #   image: rppg-visualization
+  #   container_name: rppg-visualization
+  #   volumes:
+  #     - ./data:/data:ro
+  #     - ./output:/output
+  #   command: ["--video-dir", "/data/videos", "--seg-dir", "/output/seg",
+  #             "--landmarks-dir", "/output/landmarks", "--signals-dir", "/output/signals",
+  #             "--output-dir", "/output/plots"]
+
+  # ---- CPU: signals -> HR / Hb  (add when predict_hr.py / predict_hb.py exist) ----
+  # hr_prediction:
+  #   build: { context: ., dockerfile: hr_prediction/Dockerfile }
+  #   image: rppg-hr
+  #   volumes: [ "./data:/data:ro", "./output:/output" ]
+  #   command: ["--signals-dir", "/output/signals", "--ground-truth", "/data/ground_truth.csv", "--output-dir", "/output/hr"]
+
+
+#   docker compose run --rm segmentation
+#   docker compose run --rm landmarks
+#   docker compose run --rm signal_extraction
+#   docker compose run --rm visualization
