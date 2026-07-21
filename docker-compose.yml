@@ -12,7 +12,7 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    command: ["--input-dir", "/data/videos", "--output-dir", "/output/seg", "--device", "cuda"]
+    command: ["--input-dir", "/data/videos", "--output-dir", "/output/seg", "--device", "cuda", "--scale", "0.5"]
 
   landmarks:
     image: rppg-landmarks

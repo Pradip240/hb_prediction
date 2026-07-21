@@ -1,8 +1,8 @@
-"""Run SegFormer face-parsing on every frame of every video; save one .npy per clip.
+"""Run SegFormer face-parsing on every frame of every video; save one .npz per clip.
 
-Output: <output-dir>/<video>_seg.npy  with shape (T, H, W) uint8, where each pixel
-is a face-parse class id (0 = background). The class-id -> label legend for the
-model is printed once at startup.
+Output: <output-dir>/<video>_seg.npz with key "masks" and shape (T, H, W) uint8,
+where each pixel is a face-parse class id (0 = background). The class-id ->
+label legend for the model is printed once at startup.
 
 Deps:  pip install torch transformers pillow opencv-python numpy
 
@@ -22,14 +22,14 @@ VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".mov")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Save per-frame face-parse masks as .npy.")
+    ap = argparse.ArgumentParser(description="Save per-frame face-parse masks as .npz.")
     ap.add_argument("--input-dir", default="videos")
     ap.add_argument("--output-dir", default="seg_out")
     ap.add_argument("--model", default="jonathandinu/face-parsing")
     ap.add_argument("--device", default=None, help="'cuda' or 'cpu' (auto if omitted)")
     ap.add_argument("--scale", type=float, default=1.0,
-                    help="resize each mask by this factor (nearest); <1 shrinks the .npy")
-    ap.add_argument("--overwrite", action="store_true", help="redo clips whose .npy exists")
+                    help="resize each mask by this factor (nearest); <1 shrinks the output")
+    ap.add_argument("--overwrite", action="store_true", help="redo clips whose .npz exists")
     args = ap.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -43,7 +43,7 @@ def main() -> None:
 
     for i, fname in enumerate(videos, 1):
         name = os.path.splitext(fname)[0]
-        out = os.path.join(args.output_dir, f"{name}_seg.npy")
+        out = os.path.join(args.output_dir, f"{name}_seg.npz")
         if os.path.exists(out) and not args.overwrite:
             print(f"[{i}/{len(videos)}] {name}: exists, skip")
             continue
@@ -76,7 +76,7 @@ def main() -> None:
         cap.release()
 
         arr = np.stack(masks, axis=0) if masks else np.empty((0, 0, 0), dtype=np.uint8)
-        np.save(out, arr)
+        np.savez_compressed(out, masks=arr)
         print(f"[{i}/{len(videos)}] {name}: {arr.shape} -> {out}")
 
 

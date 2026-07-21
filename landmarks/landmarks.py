@@ -1,8 +1,9 @@
-"""Run MediaPipe FaceLandmarker on every frame of every video; save one .npy per clip.
+"""Run MediaPipe FaceLandmarker on every frame of every video; save one .npz per clip.
 
-Output: <output-dir>/<video>_landmarks.npy  with shape (T, 478, 3) float32, where
-the last axis is (x_pixels, y_pixels, z). z is MediaPipe's relative depth (roughly
-in image-width units; smaller = closer). Frames with no detected face are NaN.
+Output: <output-dir>/<video>_landmarks.npz with key "landmarks" and shape
+(T, 478, 3) float32, where the last axis is (x_pixels, y_pixels, z). z is
+MediaPipe's relative depth (roughly in image-width units; smaller = closer).
+Frames with no detected face are NaN.
 
 Runs on the GPU delegate by default (MediaPipe uses OpenGL/EGL, Ubuntu only) and
 falls back to CPU automatically if the GPU delegate can't initialise.
@@ -65,12 +66,12 @@ def resolve_delegate(requested: str):
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Save per-frame MediaPipe face landmarks as .npy.")
+    ap = argparse.ArgumentParser(description="Save per-frame MediaPipe face landmarks as .npz.")
     ap.add_argument("--input-dir", default="videos")
     ap.add_argument("--output-dir", default="lmk_out")
     ap.add_argument("--delegate", choices=["gpu", "cpu"], default="gpu",
                     help="inference delegate; 'gpu' (OpenGL/EGL) falls back to CPU if unavailable")
-    ap.add_argument("--overwrite", action="store_true", help="redo clips whose .npy exists")
+    ap.add_argument("--overwrite", action="store_true", help="redo clips whose .npz exists")
     args = ap.parse_args()
 
     if not os.path.exists(MODEL_PATH):
@@ -86,7 +87,7 @@ def main() -> None:
 
     for i, fname in enumerate(videos, 1):
         name = os.path.splitext(fname)[0]
-        out = os.path.join(args.output_dir, f"{name}_landmarks.npy")
+        out = os.path.join(args.output_dir, f"{name}_landmarks.npz")
         if os.path.exists(out) and not args.overwrite:
             print(f"[{i}/{len(videos)}] {name}: exists, skip")
             continue
@@ -124,7 +125,7 @@ def main() -> None:
         cap.release()
 
         arr = np.stack(frames, axis=0) if frames else np.empty((0, N_LANDMARKS, 3), dtype=np.float32)
-        np.save(out, arr)
+        np.savez_compressed(out, landmarks=arr)
         print(f"[{i}/{len(videos)}] {name}: {arr.shape} -> {out}")
 
 
