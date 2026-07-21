@@ -12,7 +12,7 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    command: ["--input-dir", "/data/videos", "--output-dir", "/output/seg", "--device", "cuda", "--scale", "0.5"]
+    command: ["--input-dir", "/data/videos", "--output-dir", "/output/seg", "--device", "cuda"]
 
   landmarks:
     image: rppg-landmarks
@@ -31,24 +31,17 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=graphics,compute,utility
     command: ["--input-dir", "/data/videos", "--output-dir", "/output/landmarks"]
 
-  # signal_extraction:
-  #   image: rppg-signal-extraction
-  #   container_name: rppg-signal-extraction
+  # signal_analysis:
+  #   build: { context: ., dockerfile: signal_analysis/Dockerfile }
+  #   image: rppg-signal-analysis
+  #   container_name: rppg-signal-analysis
   #   volumes:
   #     - ./data:/data:ro
   #     - ./output:/output
-  #   command: ["--video-dir", "/data/videos", "--seg-dir", "/output/seg",
-  #             "--landmarks-dir", "/output/landmarks", "--output-dir", "/output/signals"]
-
-  # visualization:
-  #   image: rppg-visualization
-  #   container_name: rppg-visualization
-  #   volumes:
-  #     - ./data:/data:ro
-  #     - ./output:/output
+  #     - ./signal_analysis:/app:ro
   #   command: ["--video-dir", "/data/videos", "--seg-dir", "/output/seg",
   #             "--landmarks-dir", "/output/landmarks", "--signals-dir", "/output/signals",
-  #             "--output-dir", "/output/plots"]
+  #             "--plots-dir", "/output/plots"]
 
   # ---- CPU: signals -> HR / Hb  (add when predict_hr.py / predict_hb.py exist) ----
   # hr_prediction:
@@ -60,5 +53,4 @@ services:
 
 #   docker compose run --rm segmentation
 #   docker compose run --rm landmarks
-#   docker compose run --rm signal_extraction
-#   docker compose run --rm visualization
+#   docker compose run --rm signal_analysis

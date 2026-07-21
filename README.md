@@ -8,18 +8,18 @@ The project is organised as a **staged, containerized pipeline**. It deliberatel
 
 The pipeline runs in two phases connected by files on disk:
 
-**Phase 1 — GPU preprocessing (slow, run once per dataset).** Two independent deep models process every frame of every video and cache their output as `.npy` arrays: a face-parsing network produces per-pixel skin/face segmentation, and a face-mesh detector produces per-frame landmarks.
+**Phase 1 — GPU preprocessing (slow, run once per dataset).** Two independent deep models process every frame of every video and cache their output as `.npz` arrays: a face-parsing network produces per-pixel skin/face segmentation, and a face-mesh detector produces per-frame landmarks.
 
-**Phase 2 — CPU analysis (fast, re-runnable).** Everything after that reads the cached `.npy` files instead of the video models. Signals are extracted from the segmented skin, heart rate and hemoglobin are estimated from those signals, and the results are compared against ground truth in diagnostic plots.
+**Phase 2 — CPU analysis (fast, re-runnable).** Everything after that reads the cached `.npz` files instead of the video models. Signals are extracted from the segmented skin (and visualised in the same pass), heart rate and hemoglobin are estimated from those signals, and the results are compared against ground truth in diagnostic plots.
 
-The cached `.npy` files are the **only contract between the two phases** — the analysis stages never load the deep models. Because the extracted signals depend only on the video (never on ground truth), you can change thresholds, swap algorithms, re-plot, or fix bugs and re-run *all* of Phase 2 in seconds without ever paying the GPU cost again.
+The cached `.npz` files are the **only contract between the two phases** — the analysis stages never load the deep models. Because the extracted signals depend only on the video (never on ground truth), you can change thresholds, swap algorithms, re-plot, or fix bugs and re-run *all* of Phase 2 in seconds without ever paying the GPU cost again.
 
 ```
- data/videos/ ─┬─▶ [ segmentation ] ─▶ output/seg/*.npy ───────┐
-   (+ GPU)     └─▶ [ landmarks    ] ─▶ output/landmarks/*.npy ─┤
+ data/videos/ ─┬─▶ [ segmentation ] ─▶ output/seg/*.npz ───────┐
+   (+ GPU)     └─▶ [ landmarks    ] ─▶ output/landmarks/*.npz ─┤
                                                                ▼
-                                        [ signal_extraction ] ─▶ output/signals/*.npy
-                                                               │
+                                        [ signal_analysis ] ─▶ output/signals/*.npz
+                                                               │        (+ output/plots/*.png, *.mp4)
                                      ┌─────────────────────────┼─────────────────────────┐
                                      ▼                         ▼                          │
                              [ hr_prediction ]         [ hb_prediction ]                  │
@@ -31,6 +31,8 @@ The cached `.npy` files are the **only contract between the two phases** — the
                                                   │
                                           output/plots/*.png
 ```
+
+*(The final `visualization` box is the evaluation step that compares HR/Hb results to ground truth — add it when `predict_hr.py` / `predict_hb.py` exist. Per-clip signal plots and overlay videos are now produced directly by `signal_analysis`.)*
 
 ## Project structure
 
@@ -47,12 +49,12 @@ rppg-pipeline/
 │   └── ground_truth.csv          #   true HR / Hb per clip
 │
 ├── output/                       # all stage outputs (mounted read-write)
-│   ├── seg/                      #   <clip>_seg.npy
-│   ├── landmarks/                #   <clip>_landmarks.npy
-│   ├── signals/                  #   <clip>_signals.npy
+│   ├── seg/                      #   <clip>_seg.npz
+│   ├── landmarks/                #   <clip>_landmarks.npz
+│   ├── signals/                  #   <clip>_signals.npz
 │   ├── hr/                       #   hr_results.csv
 │   ├── hb/                       #   hb_results.csv
-│   └── plots/                    #   diagnostic + evaluation PNGs
+│   └── plots/                    #   per-clip signal PNGs + overlay MP4s, and evaluation PNGs
 │
 ├── segmentation/                 # GPU · video → skin/parse masks
 │   ├── Dockerfile
@@ -63,10 +65,10 @@ rppg-pipeline/
 │   ├── requirements.txt
 │   └── landmarks.py
 │
-├── signal_extraction/            # CPU · video + seg + landmarks → rPPG signals
+├── signal_analysis/              # CPU · video + seg + landmarks → rPPG signals + plots/overlay
 │   ├── Dockerfile
 │   ├── requirements.txt
-│   └── extract_signals.py
+│   └── analyze_signals.py
 ├── hr_prediction/                # CPU · signals → heart rate
 │   ├── Dockerfile
 │   ├── requirements.txt
@@ -75,7 +77,7 @@ rppg-pipeline/
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── predict_hb.py
-└── visualization/                # CPU · results + ground_truth → plots
+└── visualization/                # CPU · results + ground_truth → evaluation plots
     ├── Dockerfile
     ├── requirements.txt
     └── visualize.py
@@ -83,19 +85,19 @@ rppg-pipeline/
 
 ## Stages
 
-Each stage is a self-contained Docker service with its own dependencies. The shared configuration and DSP live in `common/` and are copied into the four CPU images at build time.
+Each stage is a self-contained Docker service with its own dependencies. The shared configuration and DSP live in `common/` and are copied into the CPU images at build time.
 
-**`segmentation`** *(GPU)* — runs a SegFormer face-parsing model on every frame and writes one `<clip>_seg.npy` of per-pixel class ids. Keeping the full parse map (not just skin) means any region can be derived later without re-running the model.
+**`segmentation`** *(GPU)* — runs a SegFormer face-parsing model on every frame and writes one `<clip>_seg.npz` of per-pixel class ids. Keeping the full parse map (not just skin) means any region can be derived later without re-running the model.
 
-**`landmarks`** *(GPU-capable, CPU by default)* — runs MediaPipe FaceLandmarker on every frame and writes one `<clip>_landmarks.npy` of per-frame facial landmarks. MediaPipe's Python API runs on CPU, so this service does not require the GPU.
+**`landmarks`** *(GPU-capable, CPU by default)* — runs MediaPipe FaceLandmarker on every frame and writes one `<clip>_landmarks.npz` of per-frame facial landmarks. MediaPipe's Python API runs on CPU, so this service does not require the GPU.
 
-**`signal_extraction`** *(CPU)* — combines each clip's video frames with its segmentation and landmarks to produce the rPPG signals: per-region mean skin-RGB time series, written as `<clip>_signals.npy`.
+**`signal_analysis`** *(CPU)* — combines each clip's video frames with its segmentation and landmarks to produce the rPPG signals (per-region mean skin-RGB time series, written as `<clip>_signals.npz`) and, in the same pass, the diagnostic visualizations: a per-region R/G/B trace plot (`<clip>_signal.png`) and an overlay video (`<clip>_overlay.mp4`) showing the tinted skin mask and the exact ROI regions that were averaged. Because extraction and visualization share one region-selection code path, what you see in the overlay is exactly what went into the signals. Pass `--no-plot` or `--no-video` to skip either visualization output.
 
 **`hr_prediction`** *(CPU)* — turns the signals into a heart-rate estimate per clip (POS/CHROM projection, bandpass, spectral peak selection, and quality gating), writing `hr_results.csv` with the estimate and its quality metrics.
 
 **`hb_prediction`** *(CPU)* — extracts optical biomarkers (AC/DC ratios, perfusion indices, chrominance ratios) from the signals and regresses hemoglobin, writing `hb_results.csv`.
 
-**`visualization`** *(CPU)* — compares the HR/Hb results against `ground_truth.csv` and renders the diagnostic and evaluation figures into `output/plots/`.
+**`visualization`** *(CPU)* — compares the HR/Hb results against `ground_truth.csv` and renders the evaluation figures (estimated-vs-true scatter, per-clip error, algorithm comparison) into `output/plots/`.
 
 ## Requirements
 
@@ -116,7 +118,7 @@ docker compose run --rm segmentation
 docker compose run --rm landmarks
 
 # Phase 2 — CPU analysis (cheap; re-run freely)
-docker compose run --rm signal_extraction
+docker compose run --rm signal_analysis
 docker compose run --rm hr_prediction
 docker compose run --rm hb_prediction
 docker compose run --rm visualization
@@ -124,7 +126,21 @@ docker compose run --rm visualization
 
 The services are one-shot batch jobs — each runs to completion and exits — hence `run --rm` rather than `up`. Per-stage arguments can be adjusted inline in the `command:` fields of `docker-compose.yml`.
 
-Phase 1 stages are **resumable**: a clip whose `.npy` already exists is skipped, so an interrupted run simply picks up where it left off.
+Phase 1 stages are **resumable**: a clip whose `.npz` already exists is skipped, so an interrupted run simply picks up where it left off. `signal_analysis` behaves the same way per output — existing signals/plots/overlays are reused unless `--overwrite` is passed.
+
+### Editing code without rebuilding
+
+The Docker images bake in a copy of the code at build time, but for fast iteration you can bind-mount your source over that copy so edits take effect on the next `run` — no rebuild. Add these volumes to the `signal_analysis` service in `docker-compose.yml`:
+
+```yaml
+    volumes:
+      - ./data:/data:ro
+      - ./output:/output
+      - ./signal_analysis/analyze_signals.py:/app/analyze_signals.py:ro
+      - ./common:/app/common:ro
+```
+
+The mount path must match where the Dockerfile places the code (`WORKDIR /app`). After editing a `.py` file, just re-run `docker compose run --rm signal_analysis`. You only need to `docker compose build` again when `requirements.txt` changes (dependencies live in the image layers, not the mount). To keep this dev-only, put the two extra volume lines in a `docker-compose.override.yml` instead — Compose merges it automatically.
 
 ## Data formats
 
@@ -138,19 +154,19 @@ Phase 1 stages are **resumable**: a clip whose `.npy` already exists is skipped,
 | `pulse`  | ground-truth heart rate (BPM)    |
 | `hb`     | ground-truth hemoglobin (g/dL)   |
 
-### Intermediate `.npy` (the phase boundary)
+### Intermediate `.npz` (the phase boundary)
 
-| file                      | shape           | dtype   | contents                                                     |
-| ------------------------- | --------------- | ------- | ------------------------------------------------------------ |
-| `seg/<clip>_seg.npy`      | `(T, H, W)`     | uint8   | per-pixel face-parse class id per frame (0 = background)     |
-| `landmarks/<clip>_landmarks.npy` | `(T, 478, 3)` | float32 | per-frame landmarks `(x_px, y_px, z)`; NaN where no face     |
-| `signals/<clip>_signals.npy` | `(R, T, 3)`  | float64 | per-region mean skin-RGB time series (regions × frames × RGB) |
+| file                             | key         | shape         | dtype   | contents                                                     |
+| -------------------------------- | ----------- | ------------- | ------- | ------------------------------------------------------------ |
+| `seg/<clip>_seg.npz`             | `masks`     | `(T, H, W)`   | uint8   | per-pixel face-parse class id per frame (0 = background)     |
+| `landmarks/<clip>_landmarks.npz` | `landmarks` | `(T, 478, 3)` | float32 | per-frame landmarks `(x_px, y_px, z)`; NaN where no face     |
+| `signals/<clip>_signals.npz`     | `signals`   | `(R, T, 3)`   | float64 | per-region mean skin-RGB time series (regions × frames × RGB) |
 
-The masks are boolean *geometry* — colour comes from the video. Extraction combines the two (frame + mask) to build the signals.
+The masks are boolean *geometry* — colour comes from the video. `signal_analysis` combines the two (frame + mask) to build the signals.
 
 ### Outputs
 
-`hr/hr_results.csv` and `hb/hb_results.csv` hold the per-clip estimates and errors; `plots/` holds the diagnostic figures (per-clip signal/spectrum panels) and the evaluation figures (estimated-vs-true scatter, per-clip error, algorithm comparison).
+`hr/hr_results.csv` and `hb/hb_results.csv` hold the per-clip estimates and errors; `plots/` holds the per-clip diagnostic figures (signal traces and overlay videos, from `signal_analysis`) and the evaluation figures (estimated-vs-true scatter, per-clip error, algorithm comparison, from `visualization`).
 
 ## Status & known limitations
 
