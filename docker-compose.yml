@@ -1,54 +1,57 @@
 services:
-  segmentation:
-    image: rppg-segmentation
-    container_name: rppg-segmentation
-    volumes:
-      - ./data:/data:ro
-      - ./output:/output
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    command: ["--input-dir", "/data/videos", "--output-dir", "/output/seg", "--device", "cuda"]
+  # segmentation:
+  #   image: rppg-segmentation
+  #   container_name: rppg-segmentation
+  #   volumes:
+  #     - ./data:/data:ro
+  #     - ./output:/output
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
+  #   command: ["--input-dir", "/data/videos", "--output-dir", "/output/seg", "--device", "cuda"]
 
-  landmarks:
-    image: rppg-landmarks
-    container_name: rppg-landmarks
-    volumes:
-      - ./data:/data:ro
-      - ./output:/output
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    environment:
-      - NVIDIA_DRIVER_CAPABILITIES=graphics,compute,utility
-    command: ["--input-dir", "/data/videos", "--output-dir", "/output/landmarks"]
+  # landmarks:
+  #   image: rppg-landmarks
+  #   container_name: rppg-landmarks
+  #   volumes:
+  #     - ./data:/data:ro
+  #     - ./output:/output
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
+  #   environment:
+  #     - NVIDIA_DRIVER_CAPABILITIES=graphics,compute,utility
+  #   command: ["--input-dir", "/data/videos", "--output-dir", "/output/landmarks"]
 
   # signal_analysis:
-  #   build: { context: ., dockerfile: signal_analysis/Dockerfile }
   #   image: rppg-signal-analysis
   #   container_name: rppg-signal-analysis
   #   volumes:
   #     - ./data:/data:ro
   #     - ./output:/output
   #     - ./signal_analysis:/app:ro
-  #   command: ["--video-dir", "/data/videos", "--seg-dir", "/output/seg",
-  #             "--landmarks-dir", "/output/landmarks", "--signals-dir", "/output/signals",
-  #             "--plots-dir", "/output/plots"]
+  #   command: ["--video-dir", "/data/videos", "--seg-dir", "/output/seg", "--landmarks-dir", "/output/landmarks",
+  #             "--signals-dir", "/output/signals", "--plots-dir", "/output/plots", "--workers", "4",
+  #             "--no-plot", "--no-video"]
 
-  # ---- CPU: signals -> HR / Hb  (add when predict_hr.py / predict_hb.py exist) ----
-  # hr_prediction:
-  #   build: { context: ., dockerfile: hr_prediction/Dockerfile }
-  #   image: rppg-hr
-  #   volumes: [ "./data:/data:ro", "./output:/output" ]
-  #   command: ["--signals-dir", "/output/signals", "--ground-truth", "/data/ground_truth.csv", "--output-dir", "/output/hr"]
+  hr_prediction:
+    image: rppg-signal-analysis
+    container_name: rppg-hr
+    entrypoint: ["python", "predict_hr.py"]
+    volumes:
+      - ./data:/data:ro
+      - ./output:/output
+      - ./signal_analysis:/app:ro
+    command: ["--signals-dir", "/output/signals", "--ground-truth", "/data/ground_truth.csv",
+              "--output-dir", "/output/hr"]
 
 
 #   docker compose run --rm segmentation

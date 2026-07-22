@@ -79,7 +79,47 @@ MIN_CLEAN_WINDOW_SEC = 5.0
 ANALYSIS_WINDOW_SEC = 20.0
 
 # Pulse-presence gate (intrinsic; no ground truth).
-MIN_SNR_DB = 1.5
-MIN_SPATIAL_COH = 0.05
-MIN_TEMPORAL_CONSISTENCY = 0.40
-MAX_SPECTRAL_FLATNESS = 0.50
+# These four thresholds decide whether a clip is ACCEPTED. Loosening them accepts
+# more clips but admits weaker/noisier signals (the gate validates *presence*, not
+# *correctness* — see README). Tune against your ground truth. Direction to accept
+# MORE: lower MIN_SNR_DB, lower MIN_SPATIAL_COH, lower MIN_TEMPORAL_CONSISTENCY,
+# raise MAX_SPECTRAL_FLATNESS. de Haan SNR on webcam footage is often negative even
+# for a real pulse, so MIN_SNR_DB is usually the binding constraint. (Original
+# pipeline used -4.5; -6.0 here is a touch more permissive for webcam clips.)
+MIN_SNR_DB = -6.0            # min de Haan SNR (dB) of the chosen peak
+MIN_SPATIAL_COH = 0.05       # min mean cross-region pulse correlation
+MIN_TEMPORAL_CONSISTENCY = 0.30   # min fraction of sub-windows agreeing on BPM
+MAX_SPECTRAL_FLATNESS = 0.60      # max HR-band flatness (0=peaked, 1=broadband)
+
+
+# ======================================================================
+# HR prediction stage  (predict_hr.py)
+# ======================================================================
+# Minimum clip length to attempt HR estimation (seconds).
+MIN_CLIP_SEC = 6.0
+
+# Sliding analysis windows inside the clean segment.
+HR_WINDOW_SEC = 14.0          # window length (gives the filters room to settle)
+HR_WINDOW_STEP_SEC = 2.0      # hop between consecutive windows
+HR_WINDOW_MAX_NAN_FRAC = 0.35 # drop a window if more than this fraction is NaN
+                              # (raise toward 0.5 to tolerate more tracking loss)
+
+# Power spectrum (compute_power_spectrum).
+SPECTRUM_MIN_SAMPLES = 16     # shortest signal a spectrum is attempted on
+SPECTRUM_ZERO_PAD_FACTOR = 4  # zero-pad the FFT to this multiple for finer bins
+
+# de Haan SNR (compute_dehaan_snr).
+DEHAAN_HARMONIC_WIDTH_HZ = 0.1  # half-width around f0 (2x that around 2*f0), Hz
+SNR_CLIP_DB = 20.0              # SNR reported when band noise is ~0
+SNR_INVALID_DB = -99.0          # sentinel when SNR cannot be computed
+
+# Spatial coherence (compute_spatial_coherence).
+COHERENCE_MIN_SEC = 2.0       # a region needs at least this many seconds to count
+
+# Temporal consistency (compute_temporal_consistency).
+TEMPORAL_WINDOW_SEC = 4.0     # sub-window length for the stability check
+TEMPORAL_MIN_SEC = 2.0        # sub-window must be at least this long to be used
+
+# Consensus selection when POS and CHROM disagree (select_consensus_hr).
+CONSENSUS_TCOH_FLOOR = 0.40      # candidates below this consistency are penalised
+CONSENSUS_SNR_PENALTY_DB = 10.0  # SNR penalty applied to inconsistent candidates

@@ -3,14 +3,12 @@
 # ======================================================================
 
 # --- Generated pipeline outputs (all stages write here) ---
-# These are regenerable caches/results — never commit them.
 output/
 !output/.gitkeep
 !output/*/.gitkeep
 
 # --- Data inputs (large / private) ---
-# Videos are big; ground_truth may be sensitive. Keep the folders, not contents.
-data/videos/*
+data/
 !data/videos/.gitkeep
 data/ground_truth.csv
 
@@ -29,7 +27,6 @@ face_landmarker.task
 *.jpg
 *.jpeg
 *.csv
-.env
 
 # ======================================================================
 # Python
@@ -47,6 +44,7 @@ dist/
 *.egg
 
 # Virtual environments
+.env
 .venv/
 venv/
 env/
