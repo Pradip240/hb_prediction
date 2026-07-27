@@ -13,7 +13,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.signal import butter, filtfilt
 
-import config
+from common import config
 
 
 # ======================================================================

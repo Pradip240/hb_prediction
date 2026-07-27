@@ -84,8 +84,9 @@ ANALYSIS_WINDOW_SEC = 20.0
 # *correctness* — see README). Tune against your ground truth. Direction to accept
 # MORE: lower MIN_SNR_DB, lower MIN_SPATIAL_COH, lower MIN_TEMPORAL_CONSISTENCY,
 # raise MAX_SPECTRAL_FLATNESS. de Haan SNR on webcam footage is often negative even
-# for a real pulse, so MIN_SNR_DB is usually the binding constraint. (Original
-# pipeline used -4.5; -6.0 here is a touch more permissive for webcam clips.)
+# for a real pulse, so MIN_SNR_DB is usually the binding constraint. Set to -3.0
+# (tighter than a bare accept-everything) to drop the least-reliable clips now
+# that harmonic-aware peak selection makes the surviving estimates more trustworthy.
 MIN_SNR_DB = -6.0            # min de Haan SNR (dB) of the chosen peak
 MIN_SPATIAL_COH = 0.05       # min mean cross-region pulse correlation
 MIN_TEMPORAL_CONSISTENCY = 0.30   # min fraction of sub-windows agreeing on BPM
@@ -123,3 +124,14 @@ TEMPORAL_MIN_SEC = 2.0        # sub-window must be at least this long to be used
 # Consensus selection when POS and CHROM disagree (select_consensus_hr).
 CONSENSUS_TCOH_FLOOR = 0.40      # candidates below this consistency are penalised
 CONSENSUS_SNR_PENALTY_DB = 10.0  # SNR penalty applied to inconsistent candidates
+
+# ---------------------------------------------------------------------------
+# prepare_dataset stage — clean uniform 20 s window extraction for model training.
+# Thresholds are measured in REAL SECONDS (from the per-frame timestamps), not frames.
+# ---------------------------------------------------------------------------
+WINDOW_SEC = 20.0            # length of each emitted window (seconds)
+TARGET_FPS = 30.0           # uniform resample rate -> WIN_LEN = WINDOW_SEC*TARGET_FPS = 600 samples
+WINDOW_STEP_SEC = 20.0      # placement step; == WINDOW_SEC means non-overlapping windows
+MAX_GAP_SEC = 1.0           # reject a window if any single broken stretch exceeds this
+MAX_TOTAL_BROKEN_SEC = 5.0  # reject a window if total broken time exceeds this
+GAP_FACTOR = 3.0            # a real inter-frame interval > GAP_FACTOR*median counts as a missing-frame gap
