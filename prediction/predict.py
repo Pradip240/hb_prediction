@@ -80,13 +80,15 @@ def spectral_hr(sig, fps, lo=HR_LO_HZ, hi=HR_HI_HZ):
     return float(fb[i] * 60.0), conf
 
 
-def method_waveforms(signals, fps):
+def method_waveforms(signals, fps, pixel_counts=None):
     """Return dict method -> (waveform, bpm, confidence) for POS, CHROM, green.
 
-    POS/CHROM are computed on the face-averaged region RGB (mean over regions); green
-    is the face-averaged green channel. Each waveform is bandpassed for display + HR.
+    POS/CHROM are computed on the combined region RGB; green is the combined green
+    channel. Regions are combined size-aware (weighted by skin-pixel count) when counts
+    are available, else equal-weight — see sp.combine_regions. Each waveform is bandpassed
+    for display + HR.
     """
-    face = np.nanmean(signals, axis=0)               # (T, 3) region-averaged RGB
+    face = sp.combine_regions(signals, pixel_counts, fps)   # (T, 3) combined RGB
     out = {}
     pos = sp.extract_pos(face, fps=fps)
     out["POS"] = (pos, *spectral_hr(pos, fps))
@@ -345,7 +347,8 @@ def process_segment(task):
         d = np.load(seg_path)
         signals = d["signals"]
         fps = float(d["fps"]) if "fps" in getattr(d, "files", []) else config.DEFAULT_FPS
-        waves = method_waveforms(signals, fps)
+        pixel_counts = d["pixel_counts"] if "pixel_counts" in getattr(d, "files", []) else None
+        waves = method_waveforms(signals, fps, pixel_counts)
 
         # label from PPG over this segment's span
         label_hr, ppg_wave, ppg_fs = None, np.array([]), 100.0

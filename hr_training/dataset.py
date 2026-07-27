@@ -92,9 +92,9 @@ def segment_channels(signals):
     return np.stack(chans, axis=0).astype(np.float32)
 
 
-def dsp_confidence(signals, fps):
-    """Max prominence across POS/CHROM/green on the face-averaged signal (cheap)."""
-    face = np.nanmean(signals, axis=0)
+def dsp_confidence(signals, fps, pixel_counts=None):
+    """Max prominence across POS/CHROM/green on the combined signal (cheap)."""
+    face = sp.combine_regions(signals, pixel_counts, fps)
     confs = []
     for wf in (sp.extract_pos(face, fps=fps), sp.extract_chrom(face, fps=fps), face[:, 1]):
         _, c = spectral_hr(wf, fps, config.HR_FREQ_MIN_HZ if hasattr(config, "HR_FREQ_MIN_HZ") else 0.7,
@@ -125,6 +125,7 @@ def load_dataset(segments_dir, ppg_dir, manifest=None, min_bpm=40.0, max_bpm=200
         d = np.load(f)
         signals = d["signals"]
         fps = float(d["fps"]) if "fps" in getattr(d, "files", []) else 30.0
+        pixel_counts = d["pixel_counts"] if "pixel_counts" in getattr(d, "files", []) else None
 
         clip, t0, t1 = spans.get(seg_name, (None, None, None))
         if clip is None:
@@ -143,11 +144,11 @@ def load_dataset(segments_dir, ppg_dir, manifest=None, min_bpm=40.0, max_bpm=200
             continue
 
         X.append(segment_channels(signals))
-        # raw face-averaged RGB (un-normalized) so DSP baselines are computed correctly
-        raw_list.append(np.nanmean(signals, axis=0).astype(np.float32))   # (T, 3)
+        # combined RGB (un-normalized, size-aware) so DSP baselines are computed correctly
+        raw_list.append(sp.combine_regions(signals, pixel_counts, fps).astype(np.float32))   # (T, 3)
         fps_list.append(np.float32(fps))
         y.append(np.float32(label))
-        conf.append(np.float32(dsp_confidence(signals, fps)))
+        conf.append(np.float32(dsp_confidence(signals, fps, pixel_counts)))
         subj_list.append(subj)
         clip_list.append(clip)
 

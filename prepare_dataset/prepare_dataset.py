@@ -126,6 +126,11 @@ def process_clip(task):
         if T < 4 or len(ts) < T:
             return name, f"{name}: too short / timestamp mismatch, skip", 0, spans
 
+        # per-region skin-pixel counts (R, T), if present — carried through for size-aware
+        # weighting downstream. Absent in older signals.npz; then no counts are stored.
+        has_counts = "pixel_counts" in getattr(d, "files", [])
+        pix = np.asarray(d["pixel_counts"], dtype=np.float64) if has_counts else None
+
         ts0 = float(ts[0])                            # absolute start of the clip
         # relative time base and per-frame validity (valid = all regions finite)
         t = ts[:T] - ts0
@@ -180,11 +185,25 @@ def process_clip(task):
                 t0 += STEP_SEC
                 continue
 
+            # resample per-region pixel counts onto the SAME grid (linear; counts are
+            # non-negative and need no overshoot). Smooth pose ramps stay smooth ramps.
+            counts_rs = None
+            if pix is not None:
+                grid = t0 + np.arange(WIN_LEN) / TARGET_FPS
+                counts_rs = np.empty((R, WIN_LEN), dtype=np.float32)
+                pv = pix[:, lo:hi][:, vmask]                 # (R, n_valid) counts at valid times
+                for r in range(R):
+                    counts_rs[r] = np.interp(grid, tv, pv[r]).astype(np.float32)
+
             emitted += 1
             seg_name = f"{name}_{emitted}"
             out_path = os.path.join(out_dir, f"{seg_name}_signals.npz")
             if overwrite or not os.path.exists(out_path):
-                np.savez_compressed(out_path, signals=resampled, fps=np.float32(TARGET_FPS))
+                if counts_rs is not None:
+                    np.savez_compressed(out_path, signals=resampled, fps=np.float32(TARGET_FPS),
+                                        pixel_counts=counts_rs)
+                else:
+                    np.savez_compressed(out_path, signals=resampled, fps=np.float32(TARGET_FPS))
             # record this segment's real time span (relative to clip start) + absolute
             # start, so downstream can label it from the PPG over the exact same span.
             spans.append(dict(segment=seg_name, clip=name, index=emitted,

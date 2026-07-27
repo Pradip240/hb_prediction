@@ -49,14 +49,49 @@ ROI_EROSION_PX = 3     # erode the ROI inward this many px (drops the jittery ri
 SUBPIX_SHIFT = 3       # sub-pixel polygon rasterisation (1/8 px)
 MIN_SKIN_PIXELS = 80   # a region with fewer skin px is recorded as NaN
 
+# --- size-aware region weighting --------------------------------------------------
+# When the 3 regions are combined into one signal, weight each by its skin-pixel count
+# so a tiny sliver (e.g. a turned-away cheek at ~20 px) doesn't contribute equally to a
+# solid region (~1900 px) whose mean is far less noisy. Floor/cap scheme: a region below
+# MIN_SKIN_PIXELS gets weight 0; above that, weight = pixel count clipped to
+# REGION_WEIGHT_CAP_PX. Applied PER SAMPLE, so it tracks head turns (a cheek that becomes
+# a sliver mid-window loses weight at that moment). Set REGION_WEIGHT_ENABLED = False for
+# an equal-weight nanmean fallback.
+REGION_WEIGHT_ENABLED = True
+REGION_WEIGHT_CAP_PX = 1000        # counts above this are clipped (diminishing returns on size)
+REGION_WEIGHT_SMOOTH_SEC = 1.0     # low-pass the count series before weighting: keeps slow pose
+                                   # drift, drops fast flicker so the weight can't inject pulse-band
+                                   # noise. 0 = no smoothing.
+
 # One-Euro landmark smoothing (unchanged from the original tracker).
 SMOOTH_MIN_CUTOFF = 0.1
 SMOOTH_BETA = 0.005
+
+# --- SegFormer skin-mask temporal smoothing (One-Euro, per pixel) -----------------
+# The parse map flickers frame-to-frame at skin boundaries (hairline, turned cheek edge);
+# smooth_masks() applies the same One-Euro filter used for landmarks to the binary skin
+# mask over time. Set MASK_SMOOTH_ENABLED = False to extract from the raw (unsmoothed)
+# masks, e.g. to A/B compare. The cutoff/beta default to the landmark values but can be
+# tuned independently (mask flicker is faster than landmark jitter, so a lower cutoff =
+# stronger smoothing is often appropriate).
+MASK_SMOOTH_ENABLED = True
+MASK_SMOOTH_MIN_CUTOFF = 0.1
+MASK_SMOOTH_BETA = 0.005
+MASK_SMOOTH_THRESHOLD = 0.5   # re-binarise the smoothed skin-ness at this level
 
 # ======================================================================
 # Signal processing (DSP)  —  used by the HR / Hb stages
 # ======================================================================
 DEFAULT_FPS = 30.0
+
+# --- timing / PTS sanity bounds ---------------------------------------------------
+FPS_SANITY_MIN = 1.0       # reject an implied/header fps below this (Hz)
+FPS_SANITY_MAX = 1000.0    # ...or above this (guards absurd headers like 30000)
+PTS_MIN_FINITE_FRAC = 0.5  # a PTS stream needs at least this fraction finite to be used
+
+# --- overlay video appearance -----------------------------------------------------
+OVERLAY_SKIN_TINT_ALPHA = 0.25   # opacity of the skin-mask tint
+OVERLAY_REGION_FILL_ALPHA = 0.35  # opacity of the per-region fill
 
 # Physiological heart-rate passband (Hz).
 HR_FREQ_MIN_HZ = 0.83     # ~50 BPM

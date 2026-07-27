@@ -86,6 +86,61 @@ def skin_mask_from_seg(seg_frame: NDArray[np.integer]) -> NDArray[np.uint8]:
     return np.isin(seg_frame, config.SKIN_CLASS_IDS).astype(np.uint8) * 255
 
 
+def smooth_masks(masks_seq, fps: float):
+    """One-Euro smooth a (T, H, W) binary skin-mask sequence over TIME, per pixel.
+
+    The SegFormer parse flickers frame-to-frame: a pixel (typically near a skin
+    boundary such as the hairline or a turned cheek edge) flips skin/not-skin between
+    adjacent frames even when the face is still. This is the mask analog of the landmark
+    jitter that `smooth_landmarks` already fixes — so we apply the *same* One-Euro filter
+    here, per pixel, to a soft "skin-ness" value in [0, 1], then re-threshold.
+
+    Because One-Euro is motion-adaptive (its cutoff rises with the rate of change), a
+    pixel that flickers slowly gets heavy smoothing, while pixels genuinely sweeping in/out
+    during real head motion are smoothed less and so don't lag/smear — exactly the
+    behaviour that makes One-Euro suitable for the landmarks. The filter is applied to the
+    whole frame uniformly; it makes no assumption about which region is unstable.
+
+    Input may be 0/255 (as from `skin_mask_from_seg`) or 0/1; output is 0/255 uint8,
+    one stabilised mask per frame, same shape as the input.
+
+    Note: this materialises the whole sequence. For long clips, prefer `MaskSmoother`
+    (below), which filters one frame at a time with flat memory.
+    """
+    masks_seq = np.asarray(masks_seq)
+    sm = MaskSmoother(fps)
+    out = np.empty(masks_seq.shape, dtype=np.uint8)
+    for i in range(masks_seq.shape[0]):
+        out[i] = sm.step(masks_seq[i])
+    return out
+
+
+class MaskSmoother:
+    """Stateful, memory-flat One-Euro temporal smoother for per-frame skin masks.
+
+    Feed frames in order with .step(mask); it holds only the running per-pixel filter
+    state (one frame), never the whole sequence — so it is safe on full-length clips
+    inside the extraction loop. Advance it on EVERY frame (including no-face frames) to
+    keep the temporal spacing consistent; use the returned mask only where needed.
+    """
+
+    def __init__(self, fps: float):
+        self.f = OneEuroFilter(
+            freq=fps,
+            min_cutoff=getattr(config, "MASK_SMOOTH_MIN_CUTOFF", config.SMOOTH_MIN_CUTOFF),
+            beta=getattr(config, "MASK_SMOOTH_BETA", config.SMOOTH_BETA),
+        )
+        self.threshold = getattr(config, "MASK_SMOOTH_THRESHOLD", 0.5)
+
+    def step(self, mask) -> NDArray[np.uint8]:
+        soft = (np.asarray(mask) > 0).astype(np.float64)   # 0/1 skin-ness this frame
+        sm = self.f(soft)                                   # temporally-smoothed
+        return (sm >= self.threshold).astype(np.uint8) * 255
+
+    def reset(self) -> None:
+        self.f.reset()
+
+
 def fill_polygon_subpix(shape_hw: tuple[int, int], points_xy: NDArray[np.float64]) -> NDArray[np.uint8]:
     """Rasterise the convex hull of points at sub-pixel accuracy (no edge flicker)."""
     mask = np.zeros(shape_hw, dtype=np.uint8)
@@ -111,6 +166,63 @@ def region_mean_rgb(frame_bgr, region) -> NDArray[np.float64]:
         return np.array([np.nan, np.nan, np.nan], dtype=np.float64)
     mean_bgr = cv2.mean(frame_bgr, mask=region)[:3]
     return np.array(mean_bgr[::-1], dtype=np.float64)  # BGR -> RGB
+
+
+def region_mean_rgb_count(frame_bgr, region):
+    """Like region_mean_rgb, but also return the skin-pixel count used for the mean.
+
+    Returns (rgb (3,) float64, count int). Below MIN_SKIN_PIXELS the mean is NaN and the
+    count is the (sub-threshold) pixel count — stored so downstream weighting can down-
+    weight or drop the region. The count is what size-aware combination weights by.
+    """
+    count = int(cv2.countNonZero(region))
+    if count < config.MIN_SKIN_PIXELS:
+        return np.array([np.nan, np.nan, np.nan], dtype=np.float64), count
+    mean_bgr = cv2.mean(frame_bgr, mask=region)[:3]
+    return np.array(mean_bgr[::-1], dtype=np.float64), count
+
+
+def combine_regions(signals, pixel_counts=None, fps=None):
+    """Combine per-region signals (R, T, C) into one (T, C) signal.
+
+    If REGION_WEIGHT_ENABLED and pixel_counts (R, T) are given, each region is weighted
+    PER SAMPLE by its skin-pixel count under a floor/cap scheme: weight 0 below
+    MIN_SKIN_PIXELS, else min(count, REGION_WEIGHT_CAP_PX). Because the weight is per
+    sample, it tracks head movement within a window — when the head turns and a cheek
+    shrinks from a solid region to a sliver, that cheek's weight falls at that moment and
+    the still-solid regions take over. The count series is first low-pass smoothed
+    (REGION_WEIGHT_SMOOTH_SEC) so slow pose drift is kept but any residual fast flicker
+    can't modulate the combined signal in the pulse band. NaN region-samples never
+    contribute. Falls back to an equal-weight nanmean when weighting is disabled or counts
+    are unavailable.
+    """
+    signals = np.asarray(signals, dtype=np.float64)     # (R, T, C)
+    R, T, C = signals.shape
+
+    if not getattr(config, "REGION_WEIGHT_ENABLED", False) or pixel_counts is None:
+        return np.nanmean(signals, axis=0)              # equal-weight fallback
+
+    counts = np.asarray(pixel_counts, dtype=np.float64)  # (R, T)
+
+    # smooth each region's count series to keep pose drift but drop fast flicker
+    smooth_sec = getattr(config, "REGION_WEIGHT_SMOOTH_SEC", 0.0)
+    fps = fps or getattr(config, "TARGET_FPS", config.DEFAULT_FPS)
+    win = int(round(smooth_sec * fps)) if smooth_sec and smooth_sec > 0 else 0
+    if win >= 2 and T >= win:
+        kernel = np.ones(win) / win
+        counts = np.vstack([np.convolve(counts[r], kernel, mode="same") for r in range(R)])
+
+    floor = config.MIN_SKIN_PIXELS
+    cap = getattr(config, "REGION_WEIGHT_CAP_PX", 1000)
+    w = np.where(counts >= floor, np.minimum(counts, cap), 0.0)   # (R, T)
+    valid = np.isfinite(signals[:, :, 1])                # (R, T) — region can't contribute where NaN
+    w = w * valid
+    w3 = w[:, :, None]                                    # (R, T, 1) broadcast over C
+
+    wsum = w.sum(axis=0)                                  # (T,)
+    num = np.nansum(np.where(np.isfinite(signals), signals, 0.0) * w3, axis=0)  # (T, C)
+    out = np.divide(num, wsum[:, None], out=np.full((T, C), np.nan), where=wsum[:, None] > 0)
+    return out
 
 
 # ======================================================================

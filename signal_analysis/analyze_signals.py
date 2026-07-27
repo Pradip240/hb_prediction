@@ -125,7 +125,7 @@ def read_pts_seconds(video_path: str) -> np.ndarray | None:
                 except ValueError:
                     vals.append(np.nan)
         arr = np.asarray(vals, dtype=np.float64)
-        if arr.size and np.isfinite(arr).mean() > 0.5:
+        if arr.size and np.isfinite(arr).mean() > config.PTS_MIN_FINITE_FRAC:
             return arr
     return None
 
@@ -169,12 +169,12 @@ def fps_from_timestamps(pts_seconds) -> float | None:
     if span <= 0:
         return None
     fps = (len(p) - 1) / span
-    return fps if 1.0 <= fps <= 1000.0 else None
+    return fps if config.FPS_SANITY_MIN <= fps <= config.FPS_SANITY_MAX else None
 
 
 def _sane_header_fps(raw: float) -> float | None:
     """The header fps only if it's in a plausible range (rejects the 30000 quirk)."""
-    return float(raw) if raw and 1.0 <= raw <= 1000.0 else None
+    return float(raw) if raw and config.FPS_SANITY_MIN <= raw <= config.FPS_SANITY_MAX else None
 
 
 # ======================================================================
@@ -182,7 +182,10 @@ def _sane_header_fps(raw: float) -> float | None:
 # ======================================================================
 
 def extract_one(video_path, seg, landmarks, override_fps=None):
-    """Return (signals (3, T, 3), timestamps (T,), nominal_fps, timing_source).
+    """Return (signals (3, T, 3), timestamps (T,), pixel_counts (3, T), nominal_fps, timing_source).
+
+    pixel_counts[r, i] is the skin-pixel count behind signals[r, i] (stored so regions can
+    be combined size-aware downstream — see sp.combine_regions).
 
     If override_fps is given (MCD sidecar), timing is a uniform grid at that rate and
     the video PTS is ignored — used for re-encoded clips whose PTS is untrustworthy.
@@ -219,28 +222,38 @@ def extract_one(video_path, seg, landmarks, override_fps=None):
     smoothed = sp.smooth_landmarks(landmarks[:n, :, :2], nominal_fps)
     ek = sp.edge_kernel()
     signals = np.full((len(config.REGION_ORDER), n, 3), np.nan, dtype=np.float64)
+    counts = np.zeros((len(config.REGION_ORDER), n), dtype=np.int32)   # skin px per region-frame
+
+    # One-Euro temporal smoother for the SegFormer skin mask (parallel to smooth_landmarks).
+    # Advanced on EVERY frame to keep temporal spacing consistent; disabled via config.
+    mask_smoother = sp.MaskSmoother(nominal_fps) if getattr(config, "MASK_SMOOTH_ENABLED", True) else None
 
     idx = 0
     while idx < n:
         ok, frame = cap.read()
         if not ok:
             break
+        skin = sp.skin_mask_from_seg(seg[idx])
+        if mask_smoother is not None:
+            skin = mask_smoother.step(skin)     # advance filter every frame
         pt = smoothed[idx]
         if np.isfinite(pt).all():
-            skin = sp.skin_mask_from_seg(seg[idx])
             hw = frame.shape[:2]
             for r, name in enumerate(config.REGION_ORDER):
                 region = sp.build_region_mask(hw, pt[config.REGIONS[name]], skin, ek)
-                signals[r, idx, :] = sp.region_mean_rgb(frame, region)
+                rgb, cnt = sp.region_mean_rgb_count(frame, region)
+                signals[r, idx, :] = rgb
+                counts[r, idx] = cnt
         idx += 1
     cap.release()
 
     signals = signals[:, :idx, :]
+    counts = counts[:, :idx]
     if timing_source == "pts":
         timestamps = p[:idx]
     else:
         timestamps = np.arange(idx, dtype=np.float64) / (nominal_fps or config.DEFAULT_FPS)
-    return signals, timestamps, float(nominal_fps), timing_source
+    return signals, timestamps, counts, float(nominal_fps), timing_source
 
 
 # ======================================================================
@@ -287,6 +300,7 @@ def make_overlay(video_path, seg, landmarks, out_mp4, fps) -> int:
     smoothed = sp.smooth_landmarks(landmarks[:n, :, :2], fps or config.DEFAULT_FPS)
     ek = sp.edge_kernel()
     factor = 1 << config.SUBPIX_SHIFT
+    mask_smoother = sp.MaskSmoother(fps or config.DEFAULT_FPS) if getattr(config, "MASK_SMOOTH_ENABLED", True) else None
 
     writer = cv2.VideoWriter(out_mp4, cv2.VideoWriter_fourcc(*"mp4v"),
                              fps or config.DEFAULT_FPS, (width, height))
@@ -298,9 +312,11 @@ def make_overlay(video_path, seg, landmarks, out_mp4, fps) -> int:
         vis = frame.copy()
 
         skin = sp.skin_mask_from_seg(seg[idx])
+        if mask_smoother is not None:
+            skin = mask_smoother.step(skin)
         tint = np.zeros_like(vis)
         tint[skin > 0] = (0, 180, 0)
-        vis = cv2.addWeighted(vis, 1.0, tint, 0.25, 0)
+        vis = cv2.addWeighted(vis, 1.0, tint, config.OVERLAY_SKIN_TINT_ALPHA, 0)
 
         pts = smoothed[idx]
         if np.isfinite(pts).all():
@@ -310,7 +326,7 @@ def make_overlay(video_path, seg, landmarks, out_mp4, fps) -> int:
                 region = sp.build_region_mask((height, width), poly_pts, skin, ek)
                 fill = np.zeros_like(vis)
                 fill[region > 0] = color
-                vis = cv2.addWeighted(vis, 1.0, fill, 0.35, 0)
+                vis = cv2.addWeighted(vis, 1.0, fill, config.OVERLAY_REGION_FILL_ALPHA, 0)
                 hull = cv2.convexHull(poly_pts.astype(np.float32))
                 hpts = np.round(hull * factor).astype(np.int32)
                 cv2.polylines(vis, [hpts], True, color, 2, lineType=cv2.LINE_AA, shift=config.SUBPIX_SHIFT)
@@ -359,8 +375,8 @@ def process_clip(task: tuple) -> tuple[str, str, bool]:
 
         # --- 1. signals (+ per-frame timestamps) ---
         if need_extract:
-            signals, timestamps, fps, source = extract_one(video_path, seg, landmarks, override_fps)
-            np.savez_compressed(sig_path, signals=signals, timestamps=timestamps)
+            signals, timestamps, counts, fps, source = extract_one(video_path, seg, landmarks, override_fps)
+            np.savez_compressed(sig_path, signals=signals, timestamps=timestamps, pixel_counts=counts)
             valid = float(np.mean(np.isfinite(signals[:, :, 1]))) if signals.size else 0.0
             dur = (timestamps[-1] - timestamps[0]) if len(timestamps) else 0.0
             log.append(f"{name}: {signals.shape}  timing={source}  {fps:.2f} fps  "
