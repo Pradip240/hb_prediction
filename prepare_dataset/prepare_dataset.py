@@ -103,9 +103,21 @@ def _resample_window(t_valid, sig_valid, t0):
         return None
 
     grid = t0 + np.arange(WIN_LEN) / TARGET_FPS
-    # never extrapolate: valid data must bracket the whole grid
-    if t_valid[0] > grid[0] + 1e-9 or t_valid[-1] < grid[-1] - 1e-9:
+    # The valid data should cover the grid, but frames never land exactly on t0 /
+    # t0+WINDOW_SEC, so the data can miss each edge by up to ~one frame interval purely
+    # from sampling offset. Rejecting on any gap (the old strict "> 1e-9" test) threw out
+    # almost every window whose t0 fell between two frames — i.e. all but the first. Allow
+    # a one-frame tolerance based on the DATA's real spacing (the clip may run below
+    # TARGET_FPS — e.g. a 24 fps webcam — so 1/TARGET_FPS would be too tight); genuine
+    # missing data is caught earlier by the gap thresholds. Then clamp the few boundary
+    # grid points into the data span so PCHIP never truly extrapolates. Interior points —
+    # the whole window bar the two ends — are unchanged, so the signal is neither moved
+    # nor stretched.
+    data_dt = float(np.median(np.diff(t_valid))) if len(t_valid) > 1 else 1.0 / TARGET_FPS
+    tol = 1.5 * data_dt
+    if t_valid[0] > grid[0] + tol or t_valid[-1] < grid[-1] - tol:
         return None
+    grid = np.clip(grid, t_valid[0], t_valid[-1])
     out = np.empty((WIN_LEN, sig_valid.shape[1]), dtype=np.float64)
     for c in range(sig_valid.shape[1]):
         out[:, c] = PchipInterpolator(t_valid, sig_valid[:, c])(grid)
@@ -209,7 +221,9 @@ def process_clip(task):
             spans.append(dict(segment=seg_name, clip=name, index=emitted,
                               t_start=round(float(t0), 3), t_end=round(float(t0 + WINDOW_SEC), 3),
                               abs_start=round(float(ts0 + t0), 6)))
-            t0 += WINDOW_SEC        # non-overlapping (STEP_SEC == WINDOW_SEC by default)
+            t0 += STEP_SEC          # advance by the configured step (WINDOW_STEP_SEC).
+                                    # STEP_SEC < WINDOW_SEC => overlapping windows
+                                    # (e.g. 15 s step on a 20 s window = 5 s overlap).
 
         log.append(f"{name}: {emitted} window(s) from {total:.1f}s "
                    f"({100*np.mean(valid):.0f}% frames valid, median {1/median_dt:.1f} fps)")

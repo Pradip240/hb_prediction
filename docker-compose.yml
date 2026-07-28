@@ -29,19 +29,19 @@ services:
   #             capabilities: [gpu]
   #   command: ["--input-dir", "/data/videos", "--output-dir", "/output/landmarks"]
 
-  signal_analysis:
-    image: rppg-base
-    container_name: signal-analysis
-    volumes:
-      - ./data:/data:ro
-      - ./output:/output
-      - ./common:/app/common:ro
-      - ./signal_analysis:/app/signal_analysis:ro
-    command: ["python", "signal_analysis/analyze_signals.py",
-              "--video-dir", "/data/videos", "--seg-dir", "/output/seg", "--landmarks-dir", "/output/landmarks",
-              "--signals-dir", "/output/signals", "--plots-dir", "/output/plots", "--workers", "4",
-              "--fps-sidecar", "/output/mcd_fps.csv"]
-              #, "--no-plot", "--no-video"]
+  # signal_analysis:
+  #   image: rppg-base
+  #   container_name: signal-analysis
+  #   volumes:
+  #     - ./data:/data:ro
+  #     - ./output:/output
+  #     - ./common:/app/common:ro
+  #     - ./signal_analysis:/app/signal_analysis:ro
+  #   command: ["python", "signal_analysis/analyze_signals.py",
+  #             "--video-dir", "/data/videos", "--seg-dir", "/output/seg", "--landmarks-dir", "/output/landmarks",
+  #             "--signals-dir", "/output/signals", "--plots-dir", "/output/plots", "--workers", "4",
+  #             "--fps-sidecar", "/output/mcd_fps.csv"]
+  #             #, "--no-plot", "--no-video"]
 
   # prepare_dataset:
   #   image: rppg-base
@@ -91,21 +91,21 @@ services:
   #             "--ground-truth", "/data/ground_truth.csv", "--out-dir", "/output/hb_model",
   #             "--epochs", "80", "--batch-size", "128"]
 
-  # rppg_prediction:
-  #   image: rppg-base
-  #   container_name: rppg-prediction
-  #   working_dir: /app
-  #   volumes:
-  #     - ./data:/data:ro
-  #     - ./output:/output
-  #     - ./common:/app/common:ro
-  #     - ./prediction:/app/prediction:ro
-  #     - ./hr_training:/app/hr_training:ro
-  #     - ./hb_training:/app/hb_training:ro
-  #   command: ["python", "prediction/predict.py", "--segments-dir", "/output/train_data",
-  #             "--ppg-dir", "/data/ppg", "--out-dir", "/output/prediction",
-  #             "--hr-model", "/output/hr_model/hr_model.pt", "--hb-model", "/output/hb_model/hb_model.pt",
-  #             "--workers", "4"]
+  rppg_prediction:
+    image: rppg-base
+    container_name: rppg-prediction
+    working_dir: /app
+    volumes:
+      - ./data:/data:ro
+      - ./output:/output
+      - ./common:/app/common:ro
+      - ./prediction:/app/prediction:ro
+      - ./hr_training:/app/hr_training:ro
+      - ./hb_training:/app/hb_training:ro
+    command: ["python", "prediction/predict.py", "--segments-dir", "/output/train_data",
+              "--ppg-dir", "/data/ppg", "--out-dir", "/output/prediction",
+              "--hr-model", "/output/hr_model/hr_model.pt", "--hb-model", "/output/hb_model/hb_model.pt",
+              "--workers", "4"]
 
 #   docker compose run --rm segmentation
 #   docker compose run --rm landmarks
