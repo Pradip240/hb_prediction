@@ -12,7 +12,7 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    command: ["--input-dir", "/data/videos_icu", "--output-dir", "/output/seg_out", "--batch-size", "8"]
+    command: ["--input-dir", "/data/videos", "--output-dir", "/output/seg", "--batch-size", "8"]
 
   landmarks:
     image: rppg-landmarks
@@ -27,7 +27,7 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    command: ["--input-dir", "/data/videos_icu", "--output-dir", "/output/landmarks_out"]
+    command: ["--input-dir", "/data/videos", "--output-dir", "/output/landmarks"]
 
   # signal_analysis:
   #   image: rppg-base

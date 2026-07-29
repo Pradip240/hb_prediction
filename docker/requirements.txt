@@ -1,5 +1,4 @@
-numpy==1.26.4
-scipy==1.13.1
-matplotlib==3.9.2
-opencv-python-headless==4.10.0.84
-tqdm==4.66.5
+scipy==1.18.0
+matplotlib==3.11.1
+opencv-python-headless==5.0.0.93
+tqdm==4.70.0

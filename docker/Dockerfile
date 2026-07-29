@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
+FROM pytorch/pytorch:2.12.0-cuda13.2-cudnn9-runtime
 
 WORKDIR /app
 
