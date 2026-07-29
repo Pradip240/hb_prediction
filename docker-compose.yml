@@ -1,33 +1,45 @@
 services:
-  # segmentation:
-  #   image: rppg-segmentation
-  #   container_name: rppg-segmentation
-  #   volumes:
-  #     - ./data:/data:ro
-  #     - ./output:/output
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - driver: nvidia
-  #             count: all
-  #             capabilities: [gpu]
-  #   command: ["--input-dir", "/data/videos", "--output-dir", "/output/seg", "--device", "cuda"]
+  segmentation:
+    image: rppg-segmentation
+    container_name: rppg-segmentation
+    volumes:
+      - ./data:/data:ro
+      - ./output:/output
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: ["--input-dir", "/data/videos_icu", "--output-dir", "/output/seg_out", "--batch-size", "8"]
 
-  # landmarks:
-  #   image: rppg-landmarks
-  #   container_name: rppg-landmarks
+  landmarks:
+    image: rppg-landmarks
+    container_name: rppg-landmarks
+    volumes:
+      - ./data:/data:ro
+      - ./output:/output
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: ["--input-dir", "/data/videos_icu", "--output-dir", "/output/landmarks_out"]
+
+  # signal_analysis:
+  #   image: rppg-base
+  #   container_name: signal-analysis
   #   volumes:
   #     - ./data:/data:ro
   #     - ./output:/output
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - driver: nvidia
-  #             count: all
-  #             capabilities: [gpu]
-  #   command: ["--input-dir", "/data/videos", "--output-dir", "/output/landmarks"]
+  #     - ./common:/app/common:ro
+  #     - ./signal_analysis:/app/signal_analysis:ro
+  #   command: ["python", "signal_analysis/analyze_signals.py",
+  #             "--video-dir", "/data/videos_icu", "--seg-dir", "/output/seg_out", "--landmarks-dir", "/output/landmarks_out",
+  #             "--signals-dir", "/output/signals_out", "--plots-dir", "/output/plots_out", "--workers", "2"]
 
   # signal_analysis:
   #   image: rppg-base
@@ -40,8 +52,7 @@ services:
   #   command: ["python", "signal_analysis/analyze_signals.py",
   #             "--video-dir", "/data/videos", "--seg-dir", "/output/seg", "--landmarks-dir", "/output/landmarks",
   #             "--signals-dir", "/output/signals", "--plots-dir", "/output/plots", "--workers", "4",
-  #             "--fps-sidecar", "/output/mcd_fps.csv"]
-  #             #, "--no-plot", "--no-video"]
+  #             "--fps-sidecar", "/output/mcd_fps.csv", "--no-plot", "--no-video"]
 
   # prepare_dataset:
   #   image: rppg-base
@@ -51,8 +62,8 @@ services:
   #     - ./output:/output
   #     - ./common:/app/common:ro
   #     - ./prepare_dataset:/app/prepare_dataset:ro
-  #   command: ["python", "prepare_dataset/prepare_dataset.py", "--signals-dir", "/output/signals",
-  #             "--out-dir", "/output/train_data", "--workers", "4"]
+  #   command: ["python", "prepare_dataset/prepare_dataset.py", "--signals-dir", "/output/signals_icu",
+  #             "--out-dir", "/output/train_data_icu", "--workers", "8"]
 
   # hr_training:
   #   image: rppg-base
@@ -70,7 +81,7 @@ services:
   #             count: all
   #             capabilities: [gpu]
   #   command: ["python", "hr_training/train.py", "--segments-dir", "/output/train_data", "--ppg-dir", "/data/ppg",
-  #             "--out-dir", "/output/hr_model", "--epochs", "80", "--batch-size", "128"]
+  #             "--out-dir", "/output/hr_model", "--epochs", "120", "--batch-size", "128"]
 
   # hb_training:
   #   image: rppg-base
@@ -89,23 +100,25 @@ services:
   #             capabilities: [gpu]
   #   command: ["python", "hb_training/train.py", "--segments-dir", "/output/train_data", 
   #             "--ground-truth", "/data/ground_truth.csv", "--out-dir", "/output/hb_model",
-  #             "--epochs", "80", "--batch-size", "128"]
+  #             "--epochs", "120", "--batch-size", "128"]
 
-  rppg_prediction:
-    image: rppg-base
-    container_name: rppg-prediction
-    working_dir: /app
-    volumes:
-      - ./data:/data:ro
-      - ./output:/output
-      - ./common:/app/common:ro
-      - ./prediction:/app/prediction:ro
-      - ./hr_training:/app/hr_training:ro
-      - ./hb_training:/app/hb_training:ro
-    command: ["python", "prediction/predict.py", "--segments-dir", "/output/train_data",
-              "--ppg-dir", "/data/ppg", "--out-dir", "/output/prediction",
-              "--hr-model", "/output/hr_model/hr_model.pt", "--hb-model", "/output/hb_model/hb_model.pt",
-              "--workers", "4"]
+  # rppg_prediction:
+  #   image: rppg-base
+  #   container_name: rppg-prediction
+  #   working_dir: /app
+  #   volumes:
+  #     - ./data:/data:ro
+  #     - ./output:/output
+  #     - ./common:/app/common:ro
+  #     - ./prediction:/app/prediction:ro
+  #     - ./hr_training:/app/hr_training:ro
+  #     - ./hb_training:/app/hb_training:ro
+  #   # command: ["python", "prediction/predict.py", "--segments-dir", "/output/train_data",
+  #   #           "--ppg-dir", "/data/ppg", "--ground-truth", "/data/ground_truth.csv", "--out-dir", "/output/prediction",
+  #   command: ["python", "prediction/predict.py", "--segments-dir", "/output/train_data_icu",
+  #             "--ppg-dir", "/data/ppg", "--ground-truth", "/data/ground_truth_icu.csv", "--out-dir", "/output/prediction_icu",
+  #             "--hr-model", "/output/hr_model/hr_model.pt", "--hb-model", "/output/hb_model/hb_model.pt",
+  #             "--workers", "4"]
 
 #   docker compose run --rm segmentation
 #   docker compose run --rm landmarks

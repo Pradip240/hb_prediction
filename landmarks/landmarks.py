@@ -1,130 +1,161 @@
-"""Run MediaPipe FaceLandmarker on every frame of every video; save one .npz per clip.
+"""
+Generate per-frame MediaPipe face landmarks for every video in a directory.
 
-Output: <output-dir>/<video>_landmarks.npz with key "landmarks" and shape
-(T, 478, 3) float32, where the last axis is (x_pixels, y_pixels, z). z is
-MediaPipe's relative depth (roughly in image-width units; smaller = closer).
-Frames with no detected face are NaN.
+Inputs
+------
+Input directory
+    Contains video files with one of the supported extensions:
+    (.mkv, .mp4, .avi, .mov).
 
-Runs on the GPU delegate by default (MediaPipe uses OpenGL/EGL, Ubuntu only) and
-falls back to CPU automatically if the GPU delegate can't initialise.
+Command-line arguments
+    --input-dir
+        Directory containing input videos.
+    --output-dir
+        Directory where landmark archives are written.
+    --device
+        Inference device ("gpu" or "cpu"). GPU is attempted by default and
+        automatically falls back to CPU if unavailable.
+    --overwrite
+        Recompute outputs even if they already exist.
 
-Deps:  pip install mediapipe opencv-python-headless numpy
+Outputs
+-------
+For each input video <video>, writes
 
-Usage: python landmarks.py --input-dir videos --output-dir lmk_out [--delegate gpu|cpu]
+    <output-dir>/<video>_landmarks.npz
+
+containing a single array:
+
+    landmarks : float32, shape (T, 478, 3)
+
+where:
+    T = number of frames.
+
+Each landmark stores (x_pixels, y_pixels, z), where x and y are image pixel
+coordinates and z is MediaPipe's relative depth estimate. Frames with no
+detected face are filled with NaN values.
 """
 
-import argparse
 import os
-import urllib.request
+import argparse
 
 import cv2
 import numpy as np
-import mediapipe as mp
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision as mp_vision
+import mediapipe as mp  # type: ignore
 
 VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".mov")
-MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
-    "face_landmarker/float16/1/face_landmarker.task"
-)
 MODEL_PATH = "face_landmarker.task"
 N_LANDMARKS = 478
+FRAME_INTERVAL_MS = 33
 
 
-def make_options(delegate):
-    """FaceLandmarker options for VIDEO mode using the given delegate."""
-    return mp_vision.FaceLandmarkerOptions(
-        base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH, delegate=delegate),
-        running_mode=mp_vision.RunningMode.VIDEO,
+def make_options(delegate: mp.tasks.BaseOptions.Delegate) -> mp.tasks.vision.FaceLandmarkerOptions:  # type: ignore
+    """
+    Create FaceLandmarker options for video inference.
+    """
+    return mp.tasks.vision.FaceLandmarkerOptions(  # type: ignore
+        base_options=mp.tasks.BaseOptions(  # type: ignore
+            model_asset_path=MODEL_PATH,
+            delegate=delegate,
+        ),
+        running_mode=mp.tasks.vision.RunningMode.VIDEO,  # type: ignore
         num_faces=1,
         min_face_detection_confidence=0.3,
         min_tracking_confidence=0.3,
     )
 
 
-def resolve_delegate(requested: str):
-    """Return (delegate_enum, name).
-
-    If GPU is requested but the delegate can't initialise (no EGL display in the
-    container, or a wheel built without GPU flags), fall back to CPU so the run
-    completes instead of crashing. Probes with one tiny inference.
+def resolve_device(requested: str) -> tuple[mp.tasks.BaseOptions.Delegate, str]:  # type: ignore
     """
-    Delegate = mp_python.BaseOptions.Delegate
+    Resolve the requested inference device.
+
+    Attempts to initialize the GPU device when requested and falls back to
+    the CPU device if initialization fails.
+    """
+    delegate = mp.tasks.BaseOptions.Delegate  # type: ignore
     if requested == "cpu":
-        return Delegate.CPU, "cpu"
+        return delegate.CPU, "cpu"  # type: ignore
     try:
-        probe = mp_vision.FaceLandmarker.create_from_options(make_options(Delegate.GPU))
-        probe.detect_for_video(
+        probe = mp.tasks.vision.FaceLandmarker.create_from_options(make_options(delegate.GPU)) # type: ignore
+        probe.detect_for_video(  # type: ignore
             mp.Image(image_format=mp.ImageFormat.SRGB, data=np.zeros((64, 64, 3), np.uint8)), 0
         )
-        probe.close()
-        return Delegate.GPU, "gpu"
+        probe.close() # type: ignore
+        return delegate.GPU, "gpu"  # type: ignore
     except Exception as exc:
-        print(f"GPU delegate unavailable ({type(exc).__name__}: {exc}); falling back to CPU.")
-        return Delegate.CPU, "cpu"
+        print(f"GPU device unavailable ({type(exc).__name__}: {exc}); falling back to CPU.")
+        return delegate.CPU, "cpu"  # type: ignore
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Save per-frame MediaPipe face landmarks as .npz.")
+    """
+    Process all input videos and save per-frame face landmarks as .npz files.
+    """
+    # Parse arguments
+    ap = argparse.ArgumentParser(
+        description="Save per-frame MediaPipe face landmarks as .npz."
+    )
     ap.add_argument("--input-dir", default="videos")
-    ap.add_argument("--output-dir", default="lmk_out")
-    ap.add_argument("--delegate", choices=["gpu", "cpu"], default="gpu",
-                    help="inference delegate; 'gpu' (OpenGL/EGL) falls back to CPU if unavailable")
+    ap.add_argument("--output-dir", default="landmarks")
+    ap.add_argument("--device", default="gpu", help="'gpu' or 'cpu' (auto if omitted)")
     ap.add_argument("--overwrite", action="store_true", help="redo clips whose .npz exists")
     args = ap.parse_args()
 
-    if not os.path.exists(MODEL_PATH):
-        print(f"Downloading MediaPipe model -> {MODEL_PATH}")
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-
+    # List videos to process
     os.makedirs(args.output_dir, exist_ok=True)
-    videos = sorted(f for f in os.listdir(args.input_dir) if f.lower().endswith(VIDEO_EXTS))
+    videos: list[str] = sorted(f for f in os.listdir(args.input_dir) if f.lower().endswith(VIDEO_EXTS))  # type: ignore
     print(f"{len(videos)} video(s) in {args.input_dir}")
 
-    delegate_enum, active = resolve_delegate(args.delegate)
-    print(f"delegate: {active}")
+    # Resolve inference device
+    delegate_enum, active = resolve_device(args.device)  # type: ignore
+    print(f"device: {active}")
 
+    # Process each video
     for i, fname in enumerate(videos, 1):
         name = os.path.splitext(fname)[0]
         out = os.path.join(args.output_dir, f"{name}_landmarks.npz")
+
+        # Skip already processed videos
         if os.path.exists(out) and not args.overwrite:
             print(f"[{i}/{len(videos)}] {name}: exists, skip")
             continue
 
+        # Open video
         cap = cv2.VideoCapture(os.path.join(args.input_dir, fname))
         if not cap.isOpened():
             print(f"[{i}/{len(videos)}] {name}: cannot open, skip")
             continue
-
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        frames = []
-        with mp_vision.FaceLandmarker.create_from_options(make_options(delegate_enum)) as landmarker:
+        # Extract landmarks
+        frames: list[np.ndarray] = []
+        with mp.tasks.vision.FaceLandmarker.create_from_options(make_options(delegate_enum)) as landmarker: # type: ignore
             frame_idx = 0
+            # Read frames
             while True:
                 ok, frame = cap.read()
                 if not ok:
                     break
-                ts_ms = int(round(frame_idx * 1000.0 / fps))
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                result = landmarker.detect_for_video(
+                ts_ms = frame_idx * FRAME_INTERVAL_MS
+                frame_idx += 1
+                # Extract landmarks
+                result = landmarker.detect_for_video(  # type: ignore
                     mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), ts_ms
                 )
-                if result.face_landmarks:
+                if result.face_landmarks: # type: ignore
                     pts = np.array(
-                        [[lm.x * width, lm.y * height, lm.z] for lm in result.face_landmarks[0]],
-                        dtype=np.float32,
+                        [[lm.x * width, lm.y * height, lm.z] for lm in result.face_landmarks[0]], # type: ignore
+                        dtype=np.float32
                     )
                 else:
                     pts = np.full((N_LANDMARKS, 3), np.nan, dtype=np.float32)
                 frames.append(pts)
-                frame_idx += 1
         cap.release()
 
-        arr = np.stack(frames, axis=0) if frames else np.empty((0, N_LANDMARKS, 3), dtype=np.float32)
+        # Save landmark array
+        arr: np.ndarray = (np.stack(frames, axis=0) if frames else np.empty((0, N_LANDMARKS, 3), dtype=np.float32))
         np.savez_compressed(out, landmarks=arr)
         print(f"[{i}/{len(videos)}] {name}: {arr.shape} -> {out}")
 

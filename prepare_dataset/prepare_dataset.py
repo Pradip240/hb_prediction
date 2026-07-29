@@ -138,76 +138,93 @@ def process_clip(task):
         if T < 4 or len(ts) < T:
             return name, f"{name}: too short / timestamp mismatch, skip", 0, spans
 
-        # per-region skin-pixel counts (R, T), if present — carried through for size-aware
-        # weighting downstream. Absent in older signals.npz; then no counts are stored.
         has_counts = "pixel_counts" in getattr(d, "files", [])
         pix = np.asarray(d["pixel_counts"], dtype=np.float64) if has_counts else None
 
-        ts0 = float(ts[0])                            # absolute start of the clip
-        # relative time base and per-frame validity (valid = all regions finite)
+        ts0 = float(ts[0])
         t = ts[:T] - ts0
-        valid = np.all(np.isfinite(signals[:, :, 1]), axis=0)   # face present on all regions
+        valid = np.all(np.isfinite(signals[:, :, 1]), axis=0)
         dts = np.diff(t)
         median_dt = float(np.median(dts)) if len(dts) else 1.0 / TARGET_FPS
-        total = t[-1] if T else 0.0
+        total = float(t[-1]) if T else 0.0
+        n_valid_frames = int(valid.sum())
 
-        # greedy non-overlapping placement across real time
+        # --- RELAXED TEST MODE -------------------------------------------------------
+        # Goal: get at least one window from (almost) any clip so a custom dataset can be
+        # smoke-tested end to end. Two relaxations vs the strict pipeline:
+        #  (1) adaptive window length: if the clip is shorter than WINDOW_SEC, shrink the
+        #      window to what the clip actually spans (down to RELAX_MIN_WINDOW_SEC) so a
+        #      ~20 s clip still yields a window even when WINDOW_SEC is 20.
+        #  (2) best-effort fill: NaN gaps inside the chosen span are interpolated over
+        #      rather than rejected, so partially-tracked clips still produce a window.
+        # A clip is only skipped if it has essentially NO valid signal at all.
+        min_win = getattr(config, "RELAX_MIN_WINDOW_SEC", 8.0)
+        min_valid_frac = getattr(config, "RELAX_MIN_VALID_FRAC", 0.10)  # need at least this much signal
+
+        if n_valid_frames < 4 or (n_valid_frames / max(1, T)) < min_valid_frac:
+            log.append(f"{name}: SKIP — only {100*np.mean(valid):.0f}% valid "
+                       f"({n_valid_frames}/{T} frames), below {100*min_valid_frac:.0f}% floor")
+            return name, "\n".join(log), 0, spans
+
+        # window length actually used for THIS clip: full WINDOW_SEC if it fits, else the
+        # clip span (so short ICU clips are not thrown away). Never below min_win.
+        # IMPORTANT: the OUTPUT is always WIN_LEN (600) samples regardless of the real
+        # duration, because the HR model's spectral grid is fixed to that length. A shorter
+        # real span is simply resampled to 600 points (its effective fps differs, but for a
+        # smoke test that is fine; the stored fps stays TARGET_FPS for downstream sanity).
+        eff_window = WINDOW_SEC if total + 1e-9 >= WINDOW_SEC else max(min_win, total * 0.98)
+        eff_win_len = WIN_LEN                       # ALWAYS 600 so the model can consume it
+        eff_step = STEP_SEC if STEP_SEC < eff_window else eff_window  # keep overlap sane
+
         emitted = 0
         t0 = 0.0
-        while t0 + WINDOW_SEC <= total + 1e-9:
+        made_any = False
+        while t0 + eff_window <= total + 1e-9:
             lo = np.searchsorted(t, t0, side="left")
-            hi = np.searchsorted(t, t0 + WINDOW_SEC, side="right")
+            hi = np.searchsorted(t, t0 + eff_window, side="right")
             t_win = t[lo:hi]
             valid_win = valid[lo:hi]
-            if len(t_win) < 4:
-                t0 += STEP_SEC
+            if valid_win.sum() < 4:
+                t0 += eff_step
                 continue
 
-            runs = _broken_runs_seconds(t_win, valid_win, median_dt)
-            worst = max(runs) if runs else 0.0
-            broken_total = sum(runs)
-
-            if worst > MAX_GAP_SEC or broken_total > MAX_TOTAL_BROKEN_SEC:
-                # window unusable — jump past the FIRST offending gap, else step on
-                advanced = False
-                acc = 0.0
-                for i in range(1, len(t_win)):
-                    gap = t_win[i] - t_win[i - 1]
-                    if gap > GAP_FACTOR * median_dt and gap > MAX_GAP_SEC:
-                        t0 = t_win[i]           # restart just after the big gap
-                        advanced = True
-                        break
-                if not advanced:
-                    t0 += STEP_SEC
-                continue
-
-            # accepted: drop NaN samples, PCHIP-resample onto the uniform grid
+            # best-effort: resample using ONLY the valid samples in this span; np.interp /
+            # PCHIP fill the NaN gaps. We do NOT reject on gap length in relaxed mode.
             vmask = valid_win
-            tv, sv = t_win[vmask], signals[:, lo:hi, :][:, vmask, :]
-            # sv is (R, n_valid, C); resample each region
-            resampled = np.empty((R, WIN_LEN, C), dtype=np.float32)
+            tv = t_win[vmask]
+            grid = t0 + np.arange(eff_win_len) / TARGET_FPS
+            grid = np.clip(grid, tv[0], tv[-1])          # no extrapolation
+            resampled = np.empty((R, eff_win_len, C), dtype=np.float32)
             ok = True
             for r in range(R):
-                out = _resample_window(tv, sv[r], t0)
-                if out is None:
+                sv = signals[r, lo:hi, :][vmask, :]      # (n_valid, C)
+                if len(tv) < 2:
                     ok = False
                     break
-                resampled[r] = out.astype(np.float32)
+                # collapse duplicate timestamps for PCHIP
+                tvu, sv_u = tv, sv
+                if np.any(np.diff(tv) <= 0):
+                    uniq, inv = np.unique(tv, return_inverse=True)
+                    sv_u = np.empty((len(uniq), C))
+                    cnt = np.bincount(inv, minlength=len(uniq)).astype(float)
+                    for c in range(C):
+                        sv_u[:, c] = np.bincount(inv, weights=sv[:, c], minlength=len(uniq)) / cnt
+                    tvu = uniq
+                for c in range(C):
+                    resampled[r, :, c] = PchipInterpolator(tvu, sv_u[:, c])(grid).astype(np.float32)
             if not ok:
-                t0 += STEP_SEC
+                t0 += eff_step
                 continue
 
-            # resample per-region pixel counts onto the SAME grid (linear; counts are
-            # non-negative and need no overshoot). Smooth pose ramps stay smooth ramps.
             counts_rs = None
             if pix is not None:
-                grid = t0 + np.arange(WIN_LEN) / TARGET_FPS
-                counts_rs = np.empty((R, WIN_LEN), dtype=np.float32)
-                pv = pix[:, lo:hi][:, vmask]                 # (R, n_valid) counts at valid times
+                counts_rs = np.empty((R, eff_win_len), dtype=np.float32)
                 for r in range(R):
-                    counts_rs[r] = np.interp(grid, tv, pv[r]).astype(np.float32)
+                    pv = pix[r, lo:hi][vmask]
+                    counts_rs[r] = np.interp(grid, tv, pv).astype(np.float32)
 
             emitted += 1
+            made_any = True
             seg_name = f"{name}_{emitted}"
             out_path = os.path.join(out_dir, f"{seg_name}_signals.npz")
             if overwrite or not os.path.exists(out_path):
@@ -216,17 +233,58 @@ def process_clip(task):
                                         pixel_counts=counts_rs)
                 else:
                     np.savez_compressed(out_path, signals=resampled, fps=np.float32(TARGET_FPS))
-            # record this segment's real time span (relative to clip start) + absolute
-            # start, so downstream can label it from the PPG over the exact same span.
             spans.append(dict(segment=seg_name, clip=name, index=emitted,
-                              t_start=round(float(t0), 3), t_end=round(float(t0 + WINDOW_SEC), 3),
+                              t_start=round(float(t0), 3), t_end=round(float(t0 + eff_window), 3),
                               abs_start=round(float(ts0 + t0), 6)))
-            t0 += STEP_SEC          # advance by the configured step (WINDOW_STEP_SEC).
-                                    # STEP_SEC < WINDOW_SEC => overlapping windows
-                                    # (e.g. 15 s step on a 20 s window = 5 s overlap).
+            t0 += eff_step
+
+        # GUARANTEE at least one window: if the sliding loop produced nothing (e.g. the
+        # clip is a hair shorter than eff_window, or gaps kept nudging past the end), emit
+        # a single best-effort window over the clip's entire valid span.
+        if not made_any:
+            vidx = np.where(valid)[0]
+            tv = t[vidx]
+            if len(tv) >= 2:
+                grid = np.linspace(tv[0], tv[-1], eff_win_len)
+                resampled = np.empty((R, eff_win_len, C), dtype=np.float32)
+                good = True
+                for r in range(R):
+                    sv = signals[r, vidx, :]
+                    tvu, sv_u = tv, sv
+                    if np.any(np.diff(tv) <= 0):
+                        uniq, inv = np.unique(tv, return_inverse=True)
+                        sv_u = np.empty((len(uniq), C))
+                        cnt = np.bincount(inv, minlength=len(uniq)).astype(float)
+                        for c in range(C):
+                            sv_u[:, c] = np.bincount(inv, weights=sv[:, c], minlength=len(uniq)) / cnt
+                        tvu = uniq
+                    if len(tvu) < 2:
+                        good = False
+                        break
+                    for c in range(C):
+                        resampled[r, :, c] = PchipInterpolator(tvu, sv_u[:, c])(grid).astype(np.float32)
+                if good:
+                    counts_rs = None
+                    if pix is not None:
+                        counts_rs = np.empty((R, eff_win_len), dtype=np.float32)
+                        for r in range(R):
+                            counts_rs[r] = np.interp(grid, tv, pix[r, vidx]).astype(np.float32)
+                    emitted += 1
+                    seg_name = f"{name}_{emitted}"
+                    out_path = os.path.join(out_dir, f"{seg_name}_signals.npz")
+                    if overwrite or not os.path.exists(out_path):
+                        if counts_rs is not None:
+                            np.savez_compressed(out_path, signals=resampled, fps=np.float32(TARGET_FPS),
+                                                pixel_counts=counts_rs)
+                        else:
+                            np.savez_compressed(out_path, signals=resampled, fps=np.float32(TARGET_FPS))
+                    spans.append(dict(segment=seg_name, clip=name, index=emitted,
+                                      t_start=round(float(tv[0]), 3), t_end=round(float(tv[-1]), 3),
+                                      abs_start=round(float(ts0 + tv[0]), 6)))
 
         log.append(f"{name}: {emitted} window(s) from {total:.1f}s "
-                   f"({100*np.mean(valid):.0f}% frames valid, median {1/median_dt:.1f} fps)")
+                   f"(win={eff_window:.0f}s, {100*np.mean(valid):.0f}% frames valid, "
+                   f"median {1/median_dt:.1f} fps)")
         return name, "\n".join(log), emitted, spans
     except Exception as exc:
         return name, f"{name}: ERROR {type(exc).__name__}: {exc}", 0, spans
