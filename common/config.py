@@ -1,53 +1,130 @@
-"""Shared configuration for the CPU analysis stages.
+"""Configuration shared across the CPU processing pipeline.
 
-Two groups of settings:
-  * Region-of-interest definitions and mask-formation parameters, used to turn
-    the saved segmentation + landmarks into per-region signals.
-  * DSP frequency bands, detrending, and quality thresholds, used by the HR / Hb
-    stages.
-All values match the original pipeline, so results are unchanged.
+The parameters are grouped by processing stage:
+
+    - Video loading
+    - Temporal smoothing
+    - Region extraction
+    - Overlay visualization
 """
 
-# ======================================================================
-# Region of interest  (signal extraction + overlay)
-# ======================================================================
+# ============================================================================
+# Video
+# ============================================================================
 
-# ROI landmark indices (MediaPipe FaceLandmarker 478-point mesh).
+# Fallback frame rate used when the input video does not provide one.
+DEFAULT_FPS: float = 30.0
+
+
+# ============================================================================
+# Temporal smoothing
+# ============================================================================
+
+# One-Euro filter parameters used for landmark smoothing.
+SMOOTH_MIN_CUTOFF = 0.1
+SMOOTH_BETA = 0.005
+
+# Apply temporal smoothing to binary skin masks before region extraction.
+#
+# The face parser may flicker near hairlines and facial boundaries. Smoothing
+# the masks improves temporal consistency while preserving the overall shape.
+MASK_SMOOTH_ENABLED = True
+
+# Threshold used to convert the smoothed mask back to a binary image.
+MASK_SMOOTH_THRESHOLD = 0.5
+
+
+# ============================================================================
+# Facial regions
+# ============================================================================
+
+# Landmark indices defining each facial region
+# (MediaPipe Face Landmarker, 478 landmarks).
 FOREHEAD_POLY = [67, 109, 10, 338, 297, 299, 337, 151, 108, 69, 104, 9]
+
 LEFT_CHEEK_POLY = [
     116, 117, 118, 119, 100, 142, 36, 205, 187, 123, 50, 101,
     147, 213, 192, 214, 135, 138,
 ]
+
 RIGHT_CHEEK_POLY = [
     345, 346, 347, 348, 329, 371, 266, 425, 411, 352, 280, 330,
     376, 433, 416, 434, 364, 367,
 ]
 
-# Region name -> landmark polygon, and the fixed order along axis 0 of signals.npy.
+# Region definitions.
 REGIONS = {
     "forehead": FOREHEAD_POLY,
     "lcheek": LEFT_CHEEK_POLY,
     "rcheek": RIGHT_CHEEK_POLY,
 }
-REGION_ORDER = ("forehead", "lcheek", "rcheek")
 
-# Colour used to draw each region in the overlay video (BGR).
+# Fixed region order used throughout the pipeline.
+REGION_ORDER = (
+    "forehead",
+    "lcheek",
+    "rcheek",
+)
+
+# Face-parsing class IDs treated as skin.
+#
+# SegFormer classes:
+#   0 background
+#   1 skin
+#   2 nose
+#   3 eye_g
+#   4 left_eye
+#   5 right_eye
+#   6 left_brow
+#   7 right_brow
+#   8 left_ear
+#   9 right_ear
+#   10 mouth
+#   11 upper_lip
+#   12 lower_lip
+#   13 hair
+#   14 hat
+#   15 ear_ring
+#   16 neck_l
+#   17 neck
+#   18 cloth
+SKIN_CLASS_IDS = (1,)
+
+# Region-mask construction.
+ROI_EROSION_PX = 3      # Erode region boundaries to reduce edge contamination.
+SUBPIX_SHIFT = 3        # Polygon rasterization precision (1 / 2^SUBPIX_SHIFT px).
+MIN_SKIN_PIXELS = 80    # Regions below this size are marked invalid.
+
+
+# ============================================================================
+# Overlay visualization
+# ============================================================================
+
+# Region colors in BGR order.
 REGION_COLORS = {
     "forehead": (0, 255, 255),   # yellow
     "lcheek": (255, 0, 255),     # magenta
     "rcheek": (0, 255, 0),       # green
 }
 
-# Face-parse class ids treated as skin. Legend: 0 background, 1 skin, 2 nose,
-# 3 eye_g, 4 l_eye, 5 r_eye, 6 l_brow, 7 r_brow, 8 l_ear, 9 r_ear, 10 mouth,
-# 11 u_lip, 12 l_lip, 13 hair, 14 hat, 15 ear_r, 16 neck_l, 17 neck, 18 cloth.
-# The original pipeline used skin only (add 2 for 'nose' if a cheek borders it).
-SKIN_CLASS_IDS = (1,)
+# Overlay transparency.
+OVERLAY_SKIN_TINT_ALPHA = 0.25
+OVERLAY_REGION_FILL_ALPHA = 0.35
 
-# Region-mask formation (unchanged from the original tracker).
-ROI_EROSION_PX = 3     # erode the ROI inward this many px (drops the jittery rim)
-SUBPIX_SHIFT = 3       # sub-pixel polygon rasterisation (1/8 px)
-MIN_SKIN_PIXELS = 80   # a region with fewer skin px is recorded as NaN
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # --- size-aware region weighting --------------------------------------------------
 # When the 3 regions are combined into one signal, weight each by its skin-pixel count
@@ -63,35 +140,18 @@ REGION_WEIGHT_SMOOTH_SEC = 1.0     # low-pass the count series before weighting:
                                    # drift, drops fast flicker so the weight can't inject pulse-band
                                    # noise. 0 = no smoothing.
 
-# One-Euro landmark smoothing (unchanged from the original tracker).
-SMOOTH_MIN_CUTOFF = 0.1
-SMOOTH_BETA = 0.005
 
-# --- SegFormer skin-mask temporal smoothing (One-Euro, per pixel) -----------------
-# The parse map flickers frame-to-frame at skin boundaries (hairline, turned cheek edge);
-# smooth_masks() applies the same One-Euro filter used for landmarks to the binary skin
-# mask over time. Set MASK_SMOOTH_ENABLED = False to extract from the raw (unsmoothed)
-# masks, e.g. to A/B compare. The cutoff/beta default to the landmark values but can be
-# tuned independently (mask flicker is faster than landmark jitter, so a lower cutoff =
-# stronger smoothing is often appropriate).
-MASK_SMOOTH_ENABLED = True
-MASK_SMOOTH_MIN_CUTOFF = 0.1
-MASK_SMOOTH_BETA = 0.005
-MASK_SMOOTH_THRESHOLD = 0.5   # re-binarise the smoothed skin-ness at this level
 
 # ======================================================================
 # Signal processing (DSP)  —  used by the HR / Hb stages
 # ======================================================================
-DEFAULT_FPS = 30.0
 
 # --- timing / PTS sanity bounds ---------------------------------------------------
 FPS_SANITY_MIN = 1.0       # reject an implied/header fps below this (Hz)
 FPS_SANITY_MAX = 1000.0    # ...or above this (guards absurd headers like 30000)
 PTS_MIN_FINITE_FRAC = 0.5  # a PTS stream needs at least this fraction finite to be used
 
-# --- overlay video appearance -----------------------------------------------------
-OVERLAY_SKIN_TINT_ALPHA = 0.25   # opacity of the skin-mask tint
-OVERLAY_REGION_FILL_ALPHA = 0.35  # opacity of the per-region fill
+
 
 # Physiological heart-rate passband (Hz).
 HR_FREQ_MIN_HZ = 0.83     # ~50 BPM

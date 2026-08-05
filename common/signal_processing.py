@@ -10,70 +10,43 @@ Two sections:
 
 import cv2
 import numpy as np
+from cv2.typing import MatLike
 from numpy.typing import NDArray
-from scipy.signal import butter, filtfilt
+from scipy.signal import butter, filtfilt # type: ignore
 
 from common import config
-
-
-# ======================================================================
-# 1. Region extraction  (segmentation + landmarks -> per-region RGB)
-# ======================================================================
-
-class OneEuroFilter:
-    """Vectorized 1-Euro temporal filter (identical to the original tracker)."""
-
-    def __init__(self, freq: float, min_cutoff: float = 0.1, beta: float = 0.005, d_cutoff: float = 1.0):
-        self.freq = float(freq)
-        self.min_cutoff = float(min_cutoff)
-        self.beta = float(beta)
-        self.d_cutoff = float(d_cutoff)
-        self.x_prev: NDArray[np.float64] | None = None
-        self.dx_prev: NDArray[np.float64] | None = None
-
-    def _alpha(self, cutoff):
-        tau = 1.0 / (2.0 * np.pi * cutoff)
-        te = 1.0 / self.freq
-        return 1.0 / (1.0 + tau / te)
-
-    def reset(self) -> None:
-        self.x_prev = None
-        self.dx_prev = None
-
-    def __call__(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
-        if self.x_prev is None:
-            self.x_prev = x.copy()
-            self.dx_prev = np.zeros_like(x)
-            return x.copy()
-        dx = (x - self.x_prev) * self.freq
-        ad = self._alpha(self.d_cutoff)
-        dx_hat = ad * dx + (1.0 - ad) * self.dx_prev
-        vmag = np.linalg.norm(dx_hat, axis=-1, keepdims=True)
-        cutoff = self.min_cutoff + self.beta * vmag
-        a = self._alpha(cutoff)
-        x_hat = a * x + (1.0 - a) * self.x_prev
-        self.x_prev = x_hat.copy()
-        self.dx_prev = dx_hat.copy()
-        return x_hat
-
-
-def edge_kernel():
-    """Erosion kernel for shrinking the ROI inward, or None if erosion disabled."""
-    k = 2 * config.ROI_EROSION_PX + 1
-    return np.ones((k, k), np.uint8) if config.ROI_EROSION_PX > 0 else None
+from common.one_euro import OneEuroFilter
 
 
 def smooth_landmarks(pts_xy: NDArray[np.float64], fps: float) -> NDArray[np.float64]:
-    """One-Euro smooth a (T, N, 2) landmark sequence.
-
-    No-face frames (any NaN) stay NaN and reset the filter, exactly as the
-    original tracker did when a detection was missed.
     """
+    Apply One-Euro temporal smoothing to face landmarks.
+
+    Each landmark coordinate is filtered independently over time. Frames
+    containing invalid landmarks (NaN values) are preserved as NaN and reset
+    the filter state so smoothing does not propagate across missed detections.
+
+    Args:
+        pts_xy: Landmark coordinates with shape (T, N, 2), where T is the number
+            of frames and N is the number of landmarks.
+        fps: Sampling rate of the landmark sequence in frames per second.
+
+    Returns:
+        Smoothed landmark coordinates with the same shape as the input.
+    """
+    # Convert to floating-point precision suitable for recursive filtering
     pts_xy = np.asarray(pts_xy, dtype=np.float64)
+
+    # Initialize output with NaNs so invalid frames remain invalid
     out = np.full_like(pts_xy, np.nan)
+
+    # One-Euro filter shared across all landmarks
     f = OneEuroFilter(freq=fps, min_cutoff=config.SMOOTH_MIN_CUTOFF, beta=config.SMOOTH_BETA)
+
+    # Filter each frame independently
     for i in range(pts_xy.shape[0]):
         p = pts_xy[i]
+        # Reset after missed detections to avoid smoothing across gaps
         if not np.isfinite(p).all():
             f.reset()
             continue
@@ -81,105 +54,169 @@ def smooth_landmarks(pts_xy: NDArray[np.float64], fps: float) -> NDArray[np.floa
     return out
 
 
-def skin_mask_from_seg(seg_frame: NDArray[np.integer]) -> NDArray[np.uint8]:
-    """Binary 0/255 skin mask from a face-parse class map."""
+def edge_kernel() -> NDArray[np.uint8] | None:
+    """
+    Create the erosion kernel used for region mask generation.
+
+    The kernel is used to shrink each facial region inward before signal
+    extraction, reducing contamination from unstable boundary pixels.
+
+    Returns:
+        Square erosion kernel, or None when region erosion is disabled.
+    """
+    k = 2 * config.ROI_EROSION_PX + 1
+    return np.ones((k, k), np.uint8) if config.ROI_EROSION_PX > 0 else None
+
+
+def skin_mask_from_seg(seg_frame: NDArray[np.uint8]) -> NDArray[np.uint8]:
+    """
+    Convert a face-parsing mask into a binary skin mask.
+
+    Pixels belonging to the configured skin classes are assigned a value of
+    255, while all remaining pixels are assigned 0.
+
+    Args:
+        seg_frame: Face-parsing class map for a single frame.
+
+    Returns:
+        Binary skin mask with values in {0, 255}.
+    """
     return np.isin(seg_frame, config.SKIN_CLASS_IDS).astype(np.uint8) * 255
 
 
-def smooth_masks(masks_seq, fps: float):
-    """One-Euro smooth a (T, H, W) binary skin-mask sequence over TIME, per pixel.
-
-    The SegFormer parse flickers frame-to-frame: a pixel (typically near a skin
-    boundary such as the hairline or a turned cheek edge) flips skin/not-skin between
-    adjacent frames even when the face is still. This is the mask analog of the landmark
-    jitter that `smooth_landmarks` already fixes — so we apply the *same* One-Euro filter
-    here, per pixel, to a soft "skin-ness" value in [0, 1], then re-threshold.
-
-    Because One-Euro is motion-adaptive (its cutoff rises with the rate of change), a
-    pixel that flickers slowly gets heavy smoothing, while pixels genuinely sweeping in/out
-    during real head motion are smoothed less and so don't lag/smear — exactly the
-    behaviour that makes One-Euro suitable for the landmarks. The filter is applied to the
-    whole frame uniformly; it makes no assumption about which region is unstable.
-
-    Input may be 0/255 (as from `skin_mask_from_seg`) or 0/1; output is 0/255 uint8,
-    one stabilised mask per frame, same shape as the input.
-
-    Note: this materialises the whole sequence. For long clips, prefer `MaskSmoother`
-    (below), which filters one frame at a time with flat memory.
+def smooth_masks(masks: NDArray[np.uint8], fps: float) -> NDArray[np.uint8]:
     """
-    masks_seq = np.asarray(masks_seq)
-    sm = MaskSmoother(fps)
-    out = np.empty(masks_seq.shape, dtype=np.uint8)
-    for i in range(masks_seq.shape[0]):
-        out[i] = sm.step(masks_seq[i])
+    Apply One-Euro temporal smoothing to a sequence of skin masks.
+
+    Each pixel is treated as an independent time series. The binary mask is converted to a soft
+    skin-membership image (0 or 1), filtered over time, and thresholded back to a binary mask.
+
+    Args:
+        masks: Binary skin masks with shape (T, H, W).
+        fps: Sampling rate of the mask sequence in frames per second.
+
+    Returns:
+        Smoothed binary skin masks with the same shape as the input.
+    """
+    masks = np.asarray(masks)
+    # One-Euro filter shared across all segmentaions
+    filter = OneEuroFilter(freq=fps, min_cutoff=config.SMOOTH_MIN_CUTOFF, beta=config.SMOOTH_BETA)
+
+    out = np.empty_like(masks, dtype=np.uint8)
+    for i in range(masks.shape[0]):
+        # Convert the binary mask to a soft skin-membership image
+        soft = (masks[i] > 0).astype(np.float64)
+        # Apply temporal smoothing
+        smoothed = filter(soft)
+        # Convert back to a binary mask
+        out[i] = (smoothed >= config.MASK_SMOOTH_THRESHOLD).astype(np.uint8) * 255
     return out
 
 
-class MaskSmoother:
-    """Stateful, memory-flat One-Euro temporal smoother for per-frame skin masks.
-
-    Feed frames in order with .step(mask); it holds only the running per-pixel filter
-    state (one frame), never the whole sequence — so it is safe on full-length clips
-    inside the extraction loop. Advance it on EVERY frame (including no-face frames) to
-    keep the temporal spacing consistent; use the returned mask only where needed.
-    """
-
-    def __init__(self, fps: float):
-        self.f = OneEuroFilter(
-            freq=fps,
-            min_cutoff=getattr(config, "MASK_SMOOTH_MIN_CUTOFF", config.SMOOTH_MIN_CUTOFF),
-            beta=getattr(config, "MASK_SMOOTH_BETA", config.SMOOTH_BETA),
-        )
-        self.threshold = getattr(config, "MASK_SMOOTH_THRESHOLD", 0.5)
-
-    def step(self, mask) -> NDArray[np.uint8]:
-        soft = (np.asarray(mask) > 0).astype(np.float64)   # 0/1 skin-ness this frame
-        sm = self.f(soft)                                   # temporally-smoothed
-        return (sm >= self.threshold).astype(np.uint8) * 255
-
-    def reset(self) -> None:
-        self.f.reset()
-
-
 def fill_polygon_subpix(shape_hw: tuple[int, int], points_xy: NDArray[np.float64]) -> NDArray[np.uint8]:
-    """Rasterise the convex hull of points at sub-pixel accuracy (no edge flicker)."""
+    """
+    Rasterize a facial region polygon into a binary mask.
+
+    The polygon is first converted to its convex hull and then filled using sub-pixel coordinates
+    to reduce boundary jitter between consecutive frames.
+
+    Args:
+        shape_hw: Output mask shape as (height, width).
+        points_xy: Landmark coordinates defining the facial region.
+
+    Returns:
+        Binary mask of the filled facial region with values in {0, 255}.
+    """
+    # Allocate the output mask
     mask = np.zeros(shape_hw, dtype=np.uint8)
+
+    # Build a convex polygon from the region landmarks
     hull = cv2.convexHull(points_xy.astype(np.float32))
+
+    # Convert to fixed-point coordinates for sub-pixel rasterization
     factor = 1 << config.SUBPIX_SHIFT
     pts = np.round(hull * factor).astype(np.int32)
+
+    # Fill the polygon at sub-pixel precision
     cv2.fillConvexPoly(mask, pts, 255, lineType=cv2.LINE_8, shift=config.SUBPIX_SHIFT)
     return mask
 
 
-def build_region_mask(shape_hw, points_xy, skin_mask, ek) -> NDArray[np.uint8]:
-    """ROI = (landmark polygon) AND (skin), eroded inward. The original logic."""
-    poly = fill_polygon_subpix(shape_hw, points_xy)
-    region = cv2.bitwise_and(poly, skin_mask)
-    if ek is not None:
-        region = cv2.erode(region, ek, iterations=1)
-    return region
-
-
-def region_mean_rgb(frame_bgr, region) -> NDArray[np.float64]:
-    """Mean RGB over the region, or NaN if too few skin px (original threshold)."""
-    if cv2.countNonZero(region) < config.MIN_SKIN_PIXELS:
-        return np.array([np.nan, np.nan, np.nan], dtype=np.float64)
-    mean_bgr = cv2.mean(frame_bgr, mask=region)[:3]
-    return np.array(mean_bgr[::-1], dtype=np.float64)  # BGR -> RGB
-
-
-def region_mean_rgb_count(frame_bgr, region):
-    """Like region_mean_rgb, but also return the skin-pixel count used for the mean.
-
-    Returns (rgb (3,) float64, count int). Below MIN_SKIN_PIXELS the mean is NaN and the
-    count is the (sub-threshold) pixel count — stored so downstream weighting can down-
-    weight or drop the region. The count is what size-aware combination weights by.
+def build_region_masks(
+    shape_hw: tuple[int, int],
+    landmarks_xy: NDArray[np.float64],
+    skin_masks: NDArray[np.uint8],
+    kernel: NDArray[np.uint8] | None
+) -> NDArray[np.uint8]:
     """
-    count = int(cv2.countNonZero(region))
-    if count < config.MIN_SKIN_PIXELS:
-        return np.array([np.nan, np.nan, np.nan], dtype=np.float64), count
-    mean_bgr = cv2.mean(frame_bgr, mask=region)[:3]
-    return np.array(mean_bgr[::-1], dtype=np.float64), count
+    Construct skin-constrained masks for all facial regions across a frames.
+
+    The region polygons are defined by the supplied landmarks, intersected with the skin
+    segmentation mask, and eroded inward to reduce boundary contamination.
+
+    Args:
+        shape_hw: Output mask shape as (height, width).
+        landmarks_xy: Smoothed landmark coordinates with shape (478, 2).
+        skin_masks: Binary skin masks with shape (H, W).
+        kernel: Morphological erosion kernel applied to each region mask.
+
+    Returns:
+        Binary region masks with shape (R, H, W).
+    """
+    n_regions = len(config.REGION_ORDER)
+    region_masks = np.zeros((n_regions, *shape_hw), dtype=np.uint8)
+
+    # Process each region
+    for region_idx, region_name in enumerate(config.REGION_ORDER):
+        region_points = landmarks_xy[config.REGIONS[region_name]]
+        # Rasterize the landmark-defined facial region.
+        polygon = fill_polygon_subpix(shape_hw, region_points)
+        # Keep only pixels classified as skin.
+        region = polygon & skin_masks
+        # Remove unstable boundary pixels.
+        if kernel is not None:
+            region_masks[region_idx] = cv2.erode(region, kernel, iterations=1)
+    return region_masks
+
+
+def region_mean_rgb_count(
+    frame_bgr: MatLike,
+    region_masks: NDArray[np.uint8],
+) -> tuple[NDArray[np.float64], NDArray[np.int32]]:
+    """
+    Compute the mean RGB value within each facial region for a frame.
+
+    The mean is computed only when the region contains a sufficient number of
+    valid skin pixels. Otherwise, NaN values are returned so downstream stages
+    can ignore or down-weight the region while still retaining the pixel count.
+
+    Args:
+        frame_bgr: Video frame with shape (H, W, 3).
+        region_masks: Binary region masks with shape (R, H, W).
+
+    Returns:
+        A tuple containing:
+            - Mean RGB values with shape (R, 3).
+            - Valid skin-pixel counts with shape (R).
+    """
+    n_regions = region_masks.shape[0]
+    mean_rgb = np.full((n_regions, 3), np.nan, dtype=np.float64)
+    pixel_counts = np.zeros((n_regions), dtype=np.int32)
+
+    # Process each facial region.
+    for region_idx in range(n_regions):
+        mask = region_masks[region_idx]
+        # Count the number of valid pixels in the region.
+        pixel_count = int(cv2.countNonZero(mask))
+        pixel_counts[region_idx] = pixel_count
+        # Reject regions with insufficient skin coverage.
+        if pixel_count < config.MIN_SKIN_PIXELS:
+            continue
+        # Compute the mean color over the masked region.
+        mean_bgr = cv2.mean(frame_bgr, mask=mask)[:3]
+        # Convert BGR to RGB.
+        mean_rgb[region_idx] = mean_bgr[::-1]
+    return mean_rgb, pixel_counts
 
 
 def combine_regions(signals, pixel_counts=None, fps=None):

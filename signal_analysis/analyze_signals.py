@@ -1,351 +1,101 @@
-"""Extract per-region rPPG signals on a TRUE (PTS-based) time axis, and visualise.
+"""
+Extract per-region rPPG RGB signals from videos.
 
-This stage turns each clip's video + saved segmentation + landmarks into the
-per-region mean skin-RGB time series that every downstream stage (Hb prediction, HR
-prediction) consumes. It combines extraction and visualization in one pass because
-both share the same region-selection logic (skin mask AND landmark polygon, eroded
-inward), so what you *see* in the overlay is exactly what was *averaged* into the
-signals.
+Inputs
+------
+Input directories
 
-TIMING — the important part.
-Frame rate is NOT taken from the video header (which, for re-encoded files, can be
-wrong). Instead each frame's real capture time is read from the container's
-presentation timestamps (PTS) via ffprobe, and that PTS is trusted as-is:
+    --video-dir
+        Directory containing input videos:
+        (.mkv, .mp4, .avi, .mov).
 
-  * the per-region signal is plotted against real seconds (PTS - PTS[0]), so the
-    trace is undistorted even when the true frame rate is variable (e.g. network
-    cameras) or mislabelled;
-  * the per-frame timestamps are stored in the signals .npz (key "timestamps", in
-    absolute seconds) so downstream stages resample / align on real time instead of
-    assuming a constant fps. This is the ONLY timing stored: a scalar fps is
-    redundant (recover it as (n-1)/(t[-1]-t[0]) when a single number is needed) and
-    is computed on the fly only for the One-Euro landmark smoother and overlay writer.
+    --seg-dir
+        Directory containing saved face segmentation masks.
 
-Frames are paired with segmentation and landmarks strictly by index — frame i uses
-masks[i] and landmarks[i] and PTS[i] — so the correspondence holds regardless of
-frame rate. Counts are reconciled with n = min(frames, masks, landmarks, pts) so a
-one-frame tail difference never misaligns anything.
+    --landmarks-dir
+        Directory containing MediaPipe landmark archives.
 
-If ffprobe is unavailable or a file carries no usable PTS, the stage falls back to a
-uniform time axis from the header fps (logged as a warning), so it degrades
-gracefully rather than failing.
+Command-line arguments
 
-Clips are processed in parallel, one per worker process (``--workers``, default =
-all CPU cores); each clip is independent so results are identical to running
-sequentially. OpenCV is pinned to one thread per worker to avoid oversubscription.
+    --signals-dir
+        Directory where extracted signal archives are written.
 
-Usage:
-  python analyze_signals.py --video-dir data/videos --seg-dir output/seg \
-      --landmarks-dir output/landmarks --signals-dir output/signals \
-      --plots-dir output/plots [--workers N] [--no-video] [--no-plot]
+    --plots-dir
+        Directory where optional signal plots and overlay videos are written.
+
+    --workers
+        Number of parallel worker processes.
+
+    --no-plot
+        Disable RGB signal plots.
+
+    --no-video
+        Disable visualization overlay videos.
+
+    --overwrite
+        Recompute outputs even if they already exist.
+
+Outputs
+-------
+For each processed video <video>, writes
+
+    <signals-dir>/<video>_signals.npz
+
+containing:
+
+    signals : float64, shape (T, R, 3)
+        Mean RGB values for each facial region.
+
+    where:
+        T: Number of processed frames.
+        R: Number of regions defined in config.REGION_ORDER.
+        3 (Channels): [Red, Green, Blue].
+
+    timestamps : float64, shape (T,)
+        Frame timestamps in seconds.
+
+        When available these are extracted from video presentation timestamps (PTS).
+        Otherwise a uniform FPS-based timeline is used.
+
+    pixel_counts : int32, shape (T, R)
+        Number of valid skin pixels contributing to each frame/region pair.
+
+Processing
+----------
+For each frame:
+    - Load segmentation mask.
+    - Generate skin mask.
+    - Smooth facial landmarks.
+    - Intersect skin mask with landmark-defined regions.
+    - Compute mean RGB values for each region.
+
+Frames are aligned by index:
+
+    frame[i] ↔ segmentation[i] ↔ landmarks[i] ↔ timestamp[i]
+
+The number of processed frames is limited to the shortest available input.
 """
 
-import argparse
 import os
-import subprocess
+import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import cv2
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
 
 from common import config
 from common import signal_processing as sp
-import matplotlib.pyplot as plt
+from common.data_types import ClipResult, ClipTask, FileExtension, VIDEO_EXTENSIONS
+from common.visualize import plot_signals, make_overlay_frame
+from common.video_utils import video_timestamps, video_fps
 
-VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".mov")
-_PLOT_COLORS = {"forehead": "olive", "lcheek": "magenta", "rcheek": "green"}
-
-
-def load_fps_sidecar(path: str | None) -> dict[str, float]:
-    """clip -> true_fps from an mcd_fps.csv sidecar (empty dict if no path/file)."""
-    import csv
-    out: dict[str, float] = {}
-    if not path or not os.path.exists(path):
-        return out
-    with open(path, encoding="utf-8-sig") as fh:
-        for row in csv.DictReader(fh):
-            clip = row.get("clip")
-            try:
-                out[clip] = float(row.get("true_fps", ""))
-            except (TypeError, ValueError):
-                pass
-    return out
-
-
-def find_video(video_dir: str, name: str) -> str | None:
-    for ext in VIDEO_EXTS:
-        for cand in (name + ext, name + ext.upper()):
-            p = os.path.join(video_dir, cand)
-            if os.path.exists(p):
-                return p
-    for f in os.listdir(video_dir):
-        if os.path.splitext(f)[0] == name:
-            return os.path.join(video_dir, f)
-    return None
-
-
-def video_fps(video_path: str | None) -> float:
-    """Header fps — used ONLY as a last-resort fallback when PTS is unavailable."""
-    if video_path is None:
-        return config.DEFAULT_FPS
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or config.DEFAULT_FPS
-    cap.release()
-    return fps
-
-
-def read_pts_seconds(video_path: str) -> np.ndarray | None:
-    """Per-frame presentation timestamps (seconds) via ffprobe, trusted as absolute.
-
-    Tries the modern field first, then older aliases. Returns None if ffprobe is
-    missing or no field yields usable (mostly-finite) timestamps, so the caller can
-    fall back to header fps.
-    """
-    for field in ("best_effort_timestamp_time", "pts_time", "pkt_pts_time"):
-        try:
-            out = subprocess.run(
-                ["ffprobe", "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", f"frame={field}", "-of", "csv=p=0", video_path],
-                capture_output=True, text=True, timeout=1200,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return None
-        if out.returncode != 0:
-            continue
-        vals = []
-        for ln in out.stdout.splitlines():
-            ln = ln.strip()
-            if ln in ("", "N/A"):
-                vals.append(np.nan)
-            else:
-                try:
-                    vals.append(float(ln))
-                except ValueError:
-                    vals.append(np.nan)
-        arr = np.asarray(vals, dtype=np.float64)
-        if arr.size and np.isfinite(arr).mean() > config.PTS_MIN_FINITE_FRAC:
-            return arr
-    return None
-
-
-def _clean_pts(pts: np.ndarray) -> np.ndarray:
-    """Fill occasional NaN PTS by index interpolation; enforce a non-decreasing axis.
-
-    (For typical rPPG footage decode order == presentation order, so the sort is a
-    no-op; it only guards pathological B-frame reordering so the time axis stays
-    monotonic.)
-    """
-    p = np.asarray(pts, dtype=np.float64).copy()
-    if not np.isfinite(p).all():
-        idx = np.arange(len(p))
-        good = np.isfinite(p)
-        if good.sum() >= 2:
-            p[~good] = np.interp(idx[~good], idx[good], p[good])
-        else:
-            p = np.arange(len(p), dtype=np.float64)  # degenerate; will be rescaled by caller
-    if np.any(np.diff(p) < 0):
-        p = np.sort(p)
-    return p
-
-
-def fps_from_timestamps(pts_seconds) -> float | None:
-    """Robust average fps from per-frame PTS: (n-1) / (last - first).
-
-    This is the trustworthy rate — the number of frames over the real elapsed time —
-    NOT the video header (which for some containers reports a timebase like 30000).
-    Returns None if the timestamps are missing, degenerate (zero span), or the implied
-    rate is physically implausible, so the caller can warn instead of using garbage.
-    """
-    if pts_seconds is None:
-        return None
-    p = np.asarray(pts_seconds, dtype=np.float64)
-    p = p[np.isfinite(p)]
-    if len(p) < 2:
-        return None
-    p = np.sort(p)
-    span = float(p[-1] - p[0])
-    if span <= 0:
-        return None
-    fps = (len(p) - 1) / span
-    return fps if config.FPS_SANITY_MIN <= fps <= config.FPS_SANITY_MAX else None
-
-
-def _sane_header_fps(raw: float) -> float | None:
-    """The header fps only if it's in a plausible range (rejects the 30000 quirk)."""
-    return float(raw) if raw and config.FPS_SANITY_MIN <= raw <= config.FPS_SANITY_MAX else None
-
-
-# ======================================================================
-# Signal extraction  (video + seg + landmarks -> per-region RGB signals)
-# ======================================================================
-
-def extract_one(video_path, seg, landmarks, override_fps=None):
-    """Return (signals (3, T, 3), timestamps (T,), pixel_counts (3, T), nominal_fps, timing_source).
-
-    pixel_counts[r, i] is the skin-pixel count behind signals[r, i] (stored so regions can
-    be combined size-aware downstream — see sp.combine_regions).
-
-    If override_fps is given (MCD sidecar), timing is a uniform grid at that rate and
-    the video PTS is ignored — used for re-encoded clips whose PTS is untrustworthy.
-    Otherwise the real per-frame PTS is read from the video and trusted.
-    """
-    pts = None if override_fps is not None else read_pts_seconds(video_path)
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise IOError(f"cannot open {video_path}")
-    header_fps = _sane_header_fps(cap.get(cv2.CAP_PROP_FPS))   # None if absurd (e.g. 30000)
-
-    n = min(len(seg), len(landmarks))
-    if pts is not None:
-        n = min(n, len(pts))
-
-    if override_fps is not None:
-        p = None
-        nominal_fps = float(override_fps)
-        timing_source = "sidecar"
-    else:
-        pts_fps = fps_from_timestamps(pts[:n]) if (pts is not None and n > 0) else None
-        if pts_fps is not None:
-            p = _clean_pts(pts[:n])                     # real per-frame times (kept as-is)
-            nominal_fps = pts_fps                       # trustworthy average rate
-            timing_source = "pts"
-        else:
-            # No usable PTS. Do NOT trust an absurd header; fall back to a sane header
-            # value if there is one, else DEFAULT_FPS — and flag it loudly downstream.
-            p = None
-            nominal_fps = header_fps if header_fps is not None else config.DEFAULT_FPS
-            timing_source = "fps_fallback"
-
-    smoothed = sp.smooth_landmarks(landmarks[:n, :, :2], nominal_fps)
-    ek = sp.edge_kernel()
-    signals = np.full((len(config.REGION_ORDER), n, 3), np.nan, dtype=np.float64)
-    counts = np.zeros((len(config.REGION_ORDER), n), dtype=np.int32)   # skin px per region-frame
-
-    # One-Euro temporal smoother for the SegFormer skin mask (parallel to smooth_landmarks).
-    # Advanced on EVERY frame to keep temporal spacing consistent; disabled via config.
-    mask_smoother = sp.MaskSmoother(nominal_fps) if getattr(config, "MASK_SMOOTH_ENABLED", True) else None
-
-    idx = 0
-    while idx < n:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        skin = sp.skin_mask_from_seg(seg[idx])
-        if mask_smoother is not None:
-            skin = mask_smoother.step(skin)     # advance filter every frame
-        pt = smoothed[idx]
-        if np.isfinite(pt).all():
-            hw = frame.shape[:2]
-            for r, name in enumerate(config.REGION_ORDER):
-                region = sp.build_region_mask(hw, pt[config.REGIONS[name]], skin, ek)
-                rgb, cnt = sp.region_mean_rgb_count(frame, region)
-                signals[r, idx, :] = rgb
-                counts[r, idx] = cnt
-        idx += 1
-    cap.release()
-
-    signals = signals[:, :idx, :]
-    counts = counts[:, :idx]
-    if timing_source == "pts":
-        timestamps = p[:idx]
-    else:
-        timestamps = np.arange(idx, dtype=np.float64) / (nominal_fps or config.DEFAULT_FPS)
-    return signals, timestamps, counts, float(nominal_fps), timing_source
-
-
-# ======================================================================
-# Visualization  (plots + overlay video)
-# ======================================================================
-
-def _relative_time_axis(timestamps, T):
-    """Real seconds for the x-axis; falls back to a DEFAULT_FPS grid if needed."""
-    if timestamps is not None and len(timestamps) >= T and T > 0:
-        t = np.asarray(timestamps[:T], dtype=np.float64)
-        return t - t[0], "Time (s, from PTS)"
-    return np.arange(T) / config.DEFAULT_FPS, "Time (s, assumed fps)"
-
-
-def plot_signals(signals, timestamps, name, out_png) -> None:
-    _, T, _ = signals.shape
-    t, xlabel = _relative_time_axis(timestamps, T)
-    dur = t[-1] if len(t) else 0.0
-    fig, axs = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
-    channels = ["Red", "Green", "Blue"]
-    for c in range(3):
-        ax = axs[c]
-        for r, rname in enumerate(config.REGION_ORDER):
-            ax.plot(t, signals[r, :, c], color=_PLOT_COLORS[rname], linewidth=1.0, label=rname)
-        ax.set_ylabel(f"Mean {channels[c]}")
-        ax.grid(alpha=0.3)
-        if c == 0:
-            ax.legend(loc="upper right", fontsize=8)
-    axs[-1].set_xlabel(xlabel)
-    fig.suptitle(f"Per-region skin RGB — {name}  ({dur:.1f}s, {T} frames)", fontweight="bold")
-    plt.tight_layout(rect=[0, 0, 1, 0.98])
-    plt.savefig(out_png, dpi=130)
-    plt.close()
-
-
-def make_overlay(video_path, seg, landmarks, out_mp4, fps) -> int:
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise IOError(f"cannot open {video_path}")
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    n = min(len(seg), len(landmarks))
-    smoothed = sp.smooth_landmarks(landmarks[:n, :, :2], fps or config.DEFAULT_FPS)
-    ek = sp.edge_kernel()
-    factor = 1 << config.SUBPIX_SHIFT
-    mask_smoother = sp.MaskSmoother(fps or config.DEFAULT_FPS) if getattr(config, "MASK_SMOOTH_ENABLED", True) else None
-
-    writer = cv2.VideoWriter(out_mp4, cv2.VideoWriter_fourcc(*"mp4v"),
-                             fps or config.DEFAULT_FPS, (width, height))
-    idx = 0
-    while idx < n:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        vis = frame.copy()
-
-        skin = sp.skin_mask_from_seg(seg[idx])
-        if mask_smoother is not None:
-            skin = mask_smoother.step(skin)
-        tint = np.zeros_like(vis)
-        tint[skin > 0] = (0, 180, 0)
-        vis = cv2.addWeighted(vis, 1.0, tint, config.OVERLAY_SKIN_TINT_ALPHA, 0)
-
-        pts = smoothed[idx]
-        if np.isfinite(pts).all():
-            for rname in config.REGION_ORDER:
-                color = config.REGION_COLORS[rname]
-                poly_pts = pts[config.REGIONS[rname]]
-                region = sp.build_region_mask((height, width), poly_pts, skin, ek)
-                fill = np.zeros_like(vis)
-                fill[region > 0] = color
-                vis = cv2.addWeighted(vis, 1.0, fill, config.OVERLAY_REGION_FILL_ALPHA, 0)
-                hull = cv2.convexHull(poly_pts.astype(np.float32))
-                hpts = np.round(hull * factor).astype(np.int32)
-                cv2.polylines(vis, [hpts], True, color, 2, lineType=cv2.LINE_AA, shift=config.SUBPIX_SHIFT)
-        else:
-            cv2.putText(vis, "NO FACE", (15, height - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-        writer.write(vis)
-        idx += 1
-    cap.release()
-    writer.release()
-    return idx
-
-
-# ======================================================================
-# Parallel worker
-# ======================================================================
 
 def _init_worker() -> None:
+    """
+    Limit OpenCV threading inside worker processes.
+
+    Prevents CPU oversubscription when multiple clips are processed in parallel.
+    """
     try:
         cv2.setNumThreads(1)
     except Exception:
@@ -353,145 +103,255 @@ def _init_worker() -> None:
 
 
 def _default_workers() -> int:
+    """
+    Determine the default number of worker processes.
+
+    Returns:
+        Number of available CPU cores.
+    """
     try:
         return len(os.sched_getaffinity(0))
     except AttributeError:
         return os.cpu_count() or 1
 
 
-def process_clip(task: tuple) -> tuple[str, str, bool]:
-    (name, seg_path, lmk_path, video_path, sig_path, out_png, out_mp4,
-     no_plot, no_video, overwrite, override_fps) = task
-    log: list[str] = []
+def process_clip(task: ClipTask) -> ClipResult:
+    """
+    Process a single video clip.
+
+    Performs:
+        - signal extraction
+        - signal archive saving
+        - optional signal plotting
+        - optional overlay video generation
+
+    Args:
+        task:
+            Processing task describing the input files, output paths,
+            and processing options for a single clip.
+
+    Returns:
+        Processing result for the clip.
+    """
+    messages: list[str] = []
     try:
-        need_extract = overwrite or not os.path.exists(sig_path)
-        need_plot = (not no_plot) and (overwrite or not os.path.exists(out_png))
-        need_overlay = (not no_video) and (overwrite or not os.path.exists(out_mp4))
+        # Determine which outputs need to be generated
+        need_extract = task.overwrite or not os.path.exists(task.signal_path)
+        need_plot = not task.no_plot and (task.overwrite or not os.path.exists(task.plot_path))
+        need_overlay = not task.no_video and (task.overwrite or not os.path.exists(task.overlay_path))
 
-        seg = landmarks = None
-        if need_extract or need_overlay:
-            seg = np.load(seg_path)["masks"]
-            landmarks = np.load(lmk_path)["landmarks"]
+        # Nothing needs to be generated.
+        if not (need_extract or need_plot or need_overlay):
+            return ClipResult(name=task.name, log=f"{task.name}: nothing to do.", success=True)
 
-        # --- 1. signals (+ per-frame timestamps) ---
+        # Load per-frame timestamps and determine the video frame rate.
+        timestamps = np.asarray(video_timestamps(task.video_path), dtype=np.float32)
+        fps = video_fps(task.video_path) or config.DEFAULT_FPS
+
+        # Load inputs
+        segmentation = np.load(task.segmentation_path)["masks"]
+        landmarks = np.load(task.landmark_path)["landmarks"]
+        n_frames = min(len(timestamps), len(segmentation), len(landmarks))
+        signals = np.full((n_frames, len(config.REGION_ORDER), 3), np.nan, dtype=np.float64)
+        pixel_counts = np.zeros((n_frames, len(config.REGION_ORDER)), dtype=np.int32)
+
+        # Reduce landmark and segmentation jitter before downstream processing.
+        smoothed_landmarks = sp.smooth_landmarks(landmarks[:n_frames, :, :2], fps)
+        skin_masks = np.stack([sp.skin_mask_from_seg(mask) for mask in segmentation[:n_frames]])
+        smoothed_masks = sp.smooth_masks(skin_masks, fps)
+
+        # Create the erosion kernel once.
+        kernel = sp.edge_kernel()
+
+        # Open the video for sequential frame decoding.
+        capture = cv2.VideoCapture(task.video_path)
+        if not capture.isOpened():
+            raise IOError(task.video_path)
+
+        # Create overlay writer if needed.
+        writer = None
+        if need_overlay:
+            width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            writer = cv2.VideoWriter(task.overlay_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)) # type: ignore
+
+        processed_frames = 0
+        # Decode and process video frames.
+        try:
+            for frame_idx in range(n_frames):
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                processed_frames += 1
+
+                # Skip frames with invalid landmarks.
+                if not np.isfinite(smoothed_landmarks[frame_idx]).all():
+                    continue
+
+                # Build skin-constrained masks for all facial regions.
+                region_masks = sp.build_region_masks(
+                    frame.shape[:2], smoothed_landmarks[frame_idx], smoothed_masks[frame_idx], kernel
+                )
+
+                # Extract RGB signals.
+                if need_extract:
+                    signals[frame_idx], pixel_counts[frame_idx] = sp.region_mean_rgb_count(frame, region_masks)
+
+                # Write overlay.
+                if writer is not None:
+                    vis = make_overlay_frame(frame, smoothed_masks[frame_idx], region_masks, smoothed_landmarks[frame_idx])
+                    writer.write(vis)
+        finally:
+            capture.release()
+            if writer is not None:
+                writer.release()
+
+        # Update processed frames
+        signals = signals[:processed_frames]
+        pixel_counts = pixel_counts[:processed_frames]
+        timestamps = timestamps[:processed_frames]
+        n_frames = processed_frames
+
+        # Extract RGB signals
         if need_extract:
-            signals, timestamps, counts, fps, source = extract_one(video_path, seg, landmarks, override_fps)
-            np.savez_compressed(sig_path, signals=signals, timestamps=timestamps, pixel_counts=counts)
-            valid = float(np.mean(np.isfinite(signals[:, :, 1]))) if signals.size else 0.0
-            dur = (timestamps[-1] - timestamps[0]) if len(timestamps) else 0.0
-            log.append(f"{name}: {signals.shape}  timing={source}  {fps:.2f} fps  "
-                       f"({len(timestamps)} frames over {dur:.1f}s)  "
-                       f"{100 * valid:.0f}% region-frames valid -> {sig_path}")
-            if source == "fps_fallback":
-                log.append(f"    WARNING: no usable PTS for this clip; timing fell back to "
-                           f"{fps:.2f} fps (uncertain). Check that ffprobe is installed and the "
-                           f"clip has valid timestamps, or supply --fps-sidecar for it.")
+            # Save the signal
+            np.savez_compressed(task.signal_path, signals=signals, timestamps=timestamps, pixel_counts=pixel_counts)
+
+            # A region is valid if all three RGB values are finite
+            valid_regions = np.isfinite(signals).all(axis=-1)   # Shape: (T, R)
+            # A frame is valid if all regions are valid
+            valid_frames = valid_regions.any(axis=-1)            # Shape: (T,)
+            # Fraction of valid frames
+            valid_fraction = valid_frames.mean() if signals.size else 0.0
+            # Calculate duration
+            duration = (timestamps[-1] - timestamps[0] if len(timestamps) else 0.0)
+
+            # Add logs
+            messages.append(
+                f"{task.name}: {signals.shape}, fps:{fps:.2f}"
+                f" ({len(timestamps)} frames, {duration:.1f}s) "
+                f"{100 * valid_fraction:.0f}% valid -> {task.signal_path}"
+            )
+
+        # Load data if extraction of signal is not needed
         else:
-            d = np.load(sig_path)
-            signals = d["signals"]
-            timestamps = d["timestamps"] if "timestamps" in getattr(d, "files", []) else None
-            # nominal fps (only for the overlay writer) recovered from the timestamps
-            if timestamps is not None and len(timestamps) > 1 and timestamps[-1] > timestamps[0]:
-                fps = (len(timestamps) - 1) / (timestamps[-1] - timestamps[0])
-            else:
-                fps = video_fps(video_path)
-            log.append(f"{name}: signals exist, reuse {signals.shape}")
+            data = np.load(task.signal_path)
+            signals = data["signals"]
+            timestamps = data["timestamps"]
+            messages.append(f"{task.name}: signals exist, skip extraction {signals.shape}")
 
-        # --- 2. per-region signal plot (real time axis) ---
-        if not no_plot:
+
+        # Plot signals
+        if not task.no_plot:
             if need_plot:
-                plot_signals(signals, timestamps, name, out_png)
-                log.append(f"    plot -> {out_png}")
+                plot_signals(signals, timestamps, task.name, task.plot_path)
+                messages.append(f"  plot -> {task.plot_path}")
             else:
-                log.append("    plot exists, skip")
+                messages.append("   plot exists, skip")
 
-        # --- 3. overlay video ---
-        if not no_video:
+
+        # Send overlay video message
+        if not task.no_video:
             if need_overlay:
-                nframes = make_overlay(video_path, seg, landmarks, out_mp4, fps)
-                log.append(f"    overlay ({nframes} frames) -> {out_mp4}")
+                messages.append(f"    overlay ({n_frames} frames) -> {task.overlay_path}")
             else:
-                log.append("    overlay exists, skip")
-
-        return name, "\n".join(log), True
+                messages.append("    overlay exists, skip")
+        return ClipResult(task.name, "\n".join(messages), True)
     except Exception as exc:
-        return name, f"{name}: ERROR {type(exc).__name__}: {exc}", False
+        return ClipResult(task.name, f"{task.name}: ERROR {type(exc).__name__}: {exc}", False)
 
 
-# ======================================================================
-# Driver
-# ======================================================================
 
+# ============================================================================
+# Command line interface
+# ============================================================================
 def main() -> None:
+    """
+    Extract rPPG signals for all videos in a directory.
+    """
+    # Parse arguments
     ap = argparse.ArgumentParser(
-        description="Extract per-region rPPG signals (PTS-timed) and optionally plot + overlay."
+        description=("Extract per-region rPPG RGB signals from segmentation masks and landmarks.")
     )
     ap.add_argument("--video-dir", default="data/videos")
     ap.add_argument("--seg-dir", default="output/seg")
     ap.add_argument("--landmarks-dir", default="output/landmarks")
     ap.add_argument("--signals-dir", default="output/signals")
     ap.add_argument("--plots-dir", default="output/plots")
-    ap.add_argument("--no-plot", action="store_true", help="skip the per-region signal PNG")
-    ap.add_argument("--no-video", action="store_true", help="skip the overlay video")
-    ap.add_argument("--overwrite", action="store_true", help="redo clips whose outputs exist")
-    ap.add_argument("--fps-sidecar", default=None,
-                    help="optional mcd_fps.csv (clip,true_fps). For listed clips, timing is a "
-                         "uniform grid at that fps and video PTS is ignored — used to correct "
-                         "re-encoded datasets (e.g. MCD). Clips not listed still use their PTS.")
     ap.add_argument("--workers", type=int, default=0,
-                    help="parallel worker processes (0 = all available CPU cores).")
+        help=("Number of worker processes (0 = all available cores).")
+    )
+    ap.add_argument("--no-plot", action="store_true", help="Disable signal plots.")
+    ap.add_argument("--no-video", action="store_true", help="Disable overlay videos.")
+    ap.add_argument("--overwrite", action="store_true", help="Redo existing outputs.")
     args = ap.parse_args()
 
+    # Create directories
     os.makedirs(args.signals_dir, exist_ok=True)
     os.makedirs(args.plots_dir, exist_ok=True)
 
-    sidecar = load_fps_sidecar(args.fps_sidecar)
-    if sidecar:
-        print(f"fps sidecar: {len(sidecar)} clip(s) will use corrected uniform timing")
+    # List available segmentation archives
+    seg_files: list[str] = sorted(
+        f for f in os.listdir(args.seg_dir) if f.endswith(FileExtension.SEGMENTATION) # type: ignore
+    )
+    print(f"Loaded {len(seg_files)} segmentation file(s)")
 
-    seg_files = sorted(f for f in os.listdir(args.seg_dir) if f.endswith("_seg.npz"))
-    print(f"{len(seg_files)} segmentation file(s) in {args.seg_dir}")
-
-    tasks: list[tuple] = []
+    # Build one processing task per clip
+    tasks: list[ClipTask] = []
+    ext_len = len(FileExtension.SEGMENTATION)
     for seg_file in seg_files:
-        name = seg_file[: -len("_seg.npz")]
-        sig_path = os.path.join(args.signals_dir, f"{name}_signals.npz")
-        out_png = os.path.join(args.plots_dir, f"{name}_signal.png")
-        out_mp4 = os.path.join(args.plots_dir, f"{name}_overlay.mp4")
-        lmk_path = os.path.join(args.landmarks_dir, f"{name}_landmarks.npz")
-        video_path = find_video(args.video_dir, name)
-
-        if not os.path.exists(lmk_path):
-            print(f"{name}: no landmarks .npz, skip")
-            continue
-        if video_path is None:
-            print(f"{name}: no video, skip")
-            continue
-
+        # Resolve input and output paths
+        name = seg_file[:-ext_len]
         seg_path = os.path.join(args.seg_dir, seg_file)
-        tasks.append((name, seg_path, lmk_path, video_path, sig_path, out_png, out_mp4,
-                      args.no_plot, args.no_video, args.overwrite, sidecar.get(name)))
+        landmark_path = os.path.join(args.landmarks_dir, f"{name}{FileExtension.LANDMARKS}")
+        video_path = None
+        for extension in VIDEO_EXTENSIONS:
+            for candidate in (name + extension, name + extension.upper()):
+                path = os.path.join(args.video_dir, candidate)
+                if os.path.exists(path):
+                    video_path = path
+                    break
+        # Skip incomplete clips
+        if video_path is None:
+            print(f"{name}: video missing, skip")
+            continue
+        if not os.path.exists(landmark_path):
+            print(f"{name}: landmarks missing, skip")
+            continue
+        if not os.path.exists(seg_path):
+            print(f"{name}: segmentation missing, skip")
+            continue
 
+        # Create processing task
+        tasks.append(ClipTask(
+            name=name,
+            video_path=video_path,
+            segmentation_path=seg_path,
+            landmark_path=landmark_path,
+            signal_path=os.path.join(args.signals_dir, f"{name}{FileExtension.SIGNALS}"),
+            plot_path=os.path.join(args.plots_dir, f"{name}{FileExtension.SIGNAL_PLOT}"),
+            overlay_path=os.path.join(args.plots_dir, f"{name}{FileExtension.VIDEO_OVERLAY}"),
+            no_plot=args.no_plot,
+            no_video=args.no_video,
+            overwrite=args.overwrite,
+        ))
+        break
+
+    # Exit if no clips are available
     if not tasks:
-        print("nothing to process.")
+        print("Tasks not generated. Nothing to process.")
         return
 
-    n_workers = args.workers if args.workers and args.workers > 0 else _default_workers()
-    n_workers = max(1, min(n_workers, len(tasks)))
-    total = len(tasks)
-    print(f"processing {total} clip(s) on {n_workers} worker(s)")
+    # Launch worker processes
+    workers = min(args.workers if args.workers > 0 else _default_workers(), len(tasks))
+    print(f"processing {len(tasks)} clip(s) with {workers} worker(s)")
 
-    if n_workers == 1:
-        _init_worker()
-        for i, task in enumerate(tasks, 1):
-            _, msg, _ok = process_clip(task)
-            print(f"[{i}/{total}] {msg}")
-    else:
-        with ProcessPoolExecutor(max_workers=n_workers, initializer=_init_worker) as pool:
-            futures = {pool.submit(process_clip, t): t[0] for t in tasks}
-            for i, fut in enumerate(as_completed(futures), 1):
-                _, msg, _ok = fut.result()
-                print(f"[{i}/{total}] {msg}")
+    with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker) as pool:
+        futures = {pool.submit(process_clip, task): task.name for task in tasks}
+        # Report completed tasks as workers finish
+        for idx, future in enumerate(as_completed(futures), 1):
+            result = future.result()
+            print(f"[{idx}/{len(tasks)}] {result.log}")
 
 
 if __name__ == "__main__":

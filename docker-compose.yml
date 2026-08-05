@@ -1,45 +1,45 @@
 services:
-  segmentation:
-    image: rppg-segmentation
-    container_name: rppg-segmentation
-    volumes:
-      - ./data:/data:ro
-      - ./output:/output
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    command: ["--input-dir", "/data/videos", "--output-dir", "/output/seg", "--batch-size", "8"]
-
-  landmarks:
-    image: rppg-landmarks
-    container_name: rppg-landmarks
-    volumes:
-      - ./data:/data:ro
-      - ./output:/output
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    command: ["--input-dir", "/data/videos", "--output-dir", "/output/landmarks"]
-
-  # signal_analysis:
-  #   image: rppg-base
-  #   container_name: signal-analysis
+  # segmentation:
+  #   image: rppg-segmentation
+  #   container_name: rppg-segmentation
   #   volumes:
   #     - ./data:/data:ro
   #     - ./output:/output
-  #     - ./common:/app/common:ro
-  #     - ./signal_analysis:/app/signal_analysis:ro
-  #   command: ["python", "signal_analysis/analyze_signals.py",
-  #             "--video-dir", "/data/videos_icu", "--seg-dir", "/output/seg_out", "--landmarks-dir", "/output/landmarks_out",
-  #             "--signals-dir", "/output/signals_out", "--plots-dir", "/output/plots_out", "--workers", "2"]
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
+  #   command: ["--input-dir", "/data/videos", "--output-dir", "/output/seg", "--batch-size", "8"]
+
+  # landmarks:
+  #   image: rppg-landmarks
+  #   container_name: rppg-landmarks
+  #   volumes:
+  #     - ./data:/data:ro
+  #     - ./output:/output
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
+  #   command: ["--input-dir", "/data/videos", "--output-dir", "/output/landmarks"]
+
+  signal_analysis:
+    image: rppg-base
+    container_name: signal-analysis
+    volumes:
+      - ./data:/data:ro
+      - ./output:/output
+      - ./common:/app/common:ro
+      - ./signal_analysis:/app/signal_analysis:ro
+    command: ["python", "signal_analysis/analyze_signals.py",
+              "--video-dir", "/data/videos", "--seg-dir", "/output/seg", "--landmarks-dir", "/output/landmarks",
+              "--signals-dir", "/output/signals", "--plots-dir", "/output/plots", "--workers", "4"]
 
   # signal_analysis:
   #   image: rppg-base

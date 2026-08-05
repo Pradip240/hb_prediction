@@ -51,7 +51,14 @@ FRAME_INTERVAL_MS = 33
 
 def make_options(delegate: mp.tasks.BaseOptions.Delegate) -> mp.tasks.vision.FaceLandmarkerOptions:  # type: ignore
     """
-    Create FaceLandmarker options for video inference.
+    Create MediaPipe FaceLandmarker options for video inference.
+
+    Args:
+        delegate: MediaPipe inference delegate to use (CPU or GPU).
+
+    Returns:
+        MediaPipe FaceLandmarkerOptions configured for processing video
+        streams with a single tracked face.
     """
     return mp.tasks.vision.FaceLandmarkerOptions(  # type: ignore
         base_options=mp.tasks.BaseOptions(  # type: ignore
@@ -71,6 +78,14 @@ def resolve_device(requested: str) -> tuple[mp.tasks.BaseOptions.Delegate, str]:
 
     Attempts to initialize the GPU device when requested and falls back to
     the CPU device if initialization fails.
+
+    Args:
+        requested: Requested inference device ("gpu" or "cpu").
+
+    Returns:
+        A tuple containing:-
+            - The MediaPipe delegate enum to use.
+            - The resolved device name ("gpu" or "cpu").
     """
     delegate = mp.tasks.BaseOptions.Delegate  # type: ignore
     if requested == "cpu":
