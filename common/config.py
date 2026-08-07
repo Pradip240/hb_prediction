@@ -16,6 +16,7 @@ The parameters are grouped by processing stage:
 DEFAULT_FPS: float = 30.0
 
 
+
 # ============================================================================
 # Temporal smoothing
 # ============================================================================
@@ -32,6 +33,7 @@ MASK_SMOOTH_ENABLED = True
 
 # Threshold used to convert the smoothed mask back to a binary image.
 MASK_SMOOTH_THRESHOLD = 0.5
+
 
 
 # ============================================================================
@@ -96,6 +98,7 @@ SUBPIX_SHIFT = 3        # Polygon rasterization precision (1 / 2^SUBPIX_SHIFT px
 MIN_SKIN_PIXELS = 80    # Regions below this size are marked invalid.
 
 
+
 # ============================================================================
 # Overlay visualization
 # ============================================================================
@@ -113,8 +116,33 @@ OVERLAY_REGION_FILL_ALPHA = 0.35
 
 
 
+# ============================================================================
+# Dataset preparation
+# ============================================================================
 
+# Fixed window duration (seconds).
+WINDOW_SEC = 20.0
 
+# Step between consecutive windows (seconds).
+#
+# Set equal to WINDOW_SEC for non-overlapping windows.
+WINDOW_STEP_SEC = 20.0
+
+# Minimum number of facial regions that must satisfy the quality criteria for a window to be accepted.
+MIN_VALID_REGIONS = 1
+
+# Maximum duration of an individual missing-data gap allowed within a training window.
+MAX_GAP_SEC = 1.0
+
+# Maximum cumulative duration of all missing-data gaps within a training window.
+MAX_TOTAL_BROKEN_SEC = 5.0
+
+# Consecutive samples separated by more than this multiple of the
+# nominal sampling interval are considered a gap.
+GAP_FACTOR = 2.0
+
+# Target sampling frequency after interpolation (Hz).
+TARGET_FPS = 15
 
 
 
@@ -220,13 +248,3 @@ TEMPORAL_MIN_SEC = 2.0        # sub-window must be at least this long to be used
 CONSENSUS_TCOH_FLOOR = 0.40      # candidates below this consistency are penalised
 CONSENSUS_SNR_PENALTY_DB = 10.0  # SNR penalty applied to inconsistent candidates
 
-# ---------------------------------------------------------------------------
-# prepare_dataset stage — clean uniform 20 s window extraction for model training.
-# Thresholds are measured in REAL SECONDS (from the per-frame timestamps), not frames.
-# ---------------------------------------------------------------------------
-WINDOW_SEC = 20.0            # length of each emitted window (seconds)
-TARGET_FPS = 30.0           # uniform resample rate -> WIN_LEN = WINDOW_SEC*TARGET_FPS = 600 samples
-WINDOW_STEP_SEC = 20.0      # placement step; == WINDOW_SEC means non-overlapping windows
-MAX_GAP_SEC = 1.0           # reject a window if any single broken stretch exceeds this
-MAX_TOTAL_BROKEN_SEC = 5.0  # reject a window if total broken time exceeds this
-GAP_FACTOR = 3.0            # a real inter-frame interval > GAP_FACTOR*median counts as a missing-frame gap

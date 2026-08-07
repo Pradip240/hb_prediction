@@ -1,352 +1,288 @@
-"""prepare_dataset.py — clean, uniform 20 s pulse windows for HR/HB model training.
+"""
+Prepare uniformly sampled dataset windows from extracted rPPG signals.
 
-Turns each extracted <clip>_signals.npz (per-region rPPG signal + real per-frame
-timestamps) into a dataset of fixed-length, evenly-sampled 20 s windows that a model
-can consume directly. Two problems are solved here:
+Inputs
+------
+Input directory
 
-1. BROKEN REGIONS. A frame is "broken" if the region signal is NaN (face lost) or if
-   the timestamps show a gap (missing frames). Both are measured in REAL SECONDS from
-   the stored timestamps. A candidate window is accepted only if no single broken
-   stretch exceeds MAX_GAP_SEC and the total broken time is at most
-   MAX_TOTAL_BROKEN_SEC (both tunable in config.py). Windows are placed greedily:
-   slide forward, emit a clean non-overlapping window where one fits, and jump past
-   broken regions — packing in as many clean 20 s spans as the clip allows.
+    --signals-dir
+        Directory containing extracted signal archives.
 
-2. IRREGULAR SAMPLING. Webcam/RTSP frames arrive at uneven real times (jitter +
-   dropped frames). Each accepted window is RESAMPLED onto a uniform TARGET_FPS grid
-   using PCHIP (monotonic cubic) interpolation ANCHORED TO REAL TIME. Because the
-   interpolation uses the true timestamps, the pulse's frequency is preserved exactly
-   — the signal is neither stretched nor compressed (a peak at t=3.47 s stays at
-   3.47 s). NaN samples are dropped before interpolation, so NaN frames and
-   missing-frame gaps are filled by the same operation. Short gaps (< MAX_GAP_SEC)
-   are bridged; long gaps never occur here because such windows are rejected first.
+Command-line arguments
 
-Output per window: <clip>_<k>_signals.npz containing the resampled signal
-(R, WIN_LEN, 3) float32 and the scalar sample rate `fps`. No timestamps are stored —
-after uniform resampling they are implied by `fps` (the absolute per-frame times
-remain available in the source signals.npz if ever needed).
+    --out-dir
+        Directory where generated dataset windows are written.
 
-Usage:
-  python prepare_dataset.py --signals-dir output/signals --out-dir output/windows
+    --workers
+        Number of parallel worker processes.
+
+    --overwrite
+        Regenerate existing dataset windows.
+
+Outputs
+-------
+For each accepted window <clip>_<k>, writes
+
+    <out-dir>/<clip>_<k>_signals.npz
+
+containing:
+
+    signals : float32, shape (N, R, 3)
+        Uniformly resampled RGB signals.
+
+    pixel_counts : float32, shape (N, R)
+        Uniformly resampled per-region pixel counts.
+
+    fps : float32
+        Sampling frequency of the resampled signals.
+
+Additionally writes
+
+    <out-dir>/segments_manifest.csv
+
+containing metadata for every emitted dataset window.
+
+Processing
+----------
+For each extracted signal archive:
+
+    - Load extracted signals.
+    - Identify valid signal frames.
+    - Generate valid training windows.
+    - Resample accepted windows onto a uniform timeline.
+    - Save dataset windows.
+    - Record window metadata.
 """
 
-import argparse
 import os
+import csv
+import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
-from scipy.interpolate import PchipInterpolator
 
 from common import config
-
-# Windowing / resampling defaults (overridable via config.py if defined there).
-WINDOW_SEC = getattr(config, "WINDOW_SEC", 20.0)
-TARGET_FPS = getattr(config, "TARGET_FPS", 30.0)
-WIN_LEN = int(round(WINDOW_SEC * TARGET_FPS))                 # 600
-STEP_SEC = getattr(config, "WINDOW_STEP_SEC", WINDOW_SEC)     # non-overlapping by default
-MAX_GAP_SEC = getattr(config, "MAX_GAP_SEC", 1.0)            # no single broken stretch longer than this
-MAX_TOTAL_BROKEN_SEC = getattr(config, "MAX_TOTAL_BROKEN_SEC", 5.0)
-# a real inter-frame interval longer than this counts as a "missing-frame gap"
-GAP_FACTOR = getattr(config, "GAP_FACTOR", 3.0)              # gap if dt > GAP_FACTOR * median dt
+from common.data_types import DatasetTask, DatasetResult, FileExtension, WindowInfo
+from prepare_dataset.window_generation import find_windows
+from prepare_dataset.signal_interpolation import resample_region_signals, resample_pixel_counts
 
 
-def _broken_runs_seconds(t_win, valid_win, median_dt):
-    """Return a list of broken-run durations (seconds) within a window.
-
-    A broken run is a maximal stretch that is either NaN (valid=False) or separated
-    from the previous valid sample by a timestamp gap > GAP_FACTOR*median_dt. Both are
-    accumulated in real time so the >1 s / >5 s thresholds are physical, not per-frame.
+def _default_workers() -> int:
     """
-    runs = []
-    cur = 0.0
-    n = len(t_win)
-    for i in range(n):
-        gap = (t_win[i] - t_win[i - 1]) if i > 0 else 0.0
-        missing = gap > GAP_FACTOR * median_dt
-        if not valid_win[i]:
-            # NaN sample: its own share of time is ~median_dt (or the real gap to prev)
-            cur += max(gap, median_dt) if i > 0 else median_dt
-        elif missing:
-            # valid sample but a gap precedes it: the gap itself is broken time
-            cur += gap
-            if cur > 0:
-                runs.append(cur)
-                cur = 0.0
-        else:
-            if cur > 0:
-                runs.append(cur)
-                cur = 0.0
-    if cur > 0:
-        runs.append(cur)
-    return runs
+    Determine the default number of worker processes.
 
-
-def _resample_window(t_valid, sig_valid, t0):
-    """PCHIP-resample valid (time, value) samples onto a uniform TARGET_FPS grid.
-
-    Grid spans [t0, t0+WINDOW_SEC) at 1/TARGET_FPS spacing (WIN_LEN points). Returns
-    (WIN_LEN, C) or None if the valid samples don't fully cover the grid (would require
-    extrapolation). Duplicate/non-increasing timestamps are collapsed first (network
-    cameras can stamp two frames at the same wall-clock time), since PCHIP requires a
-    strictly increasing x.
+    Returns:
+        Number of available CPU cores.
     """
-    # collapse exact-duplicate timestamps: average the values at each unique time
-    t_valid = np.asarray(t_valid, dtype=np.float64)
-    if np.any(np.diff(t_valid) <= 0):
-        uniq, inv = np.unique(t_valid, return_inverse=True)
-        collapsed = np.empty((len(uniq), sig_valid.shape[1]), dtype=np.float64)
-        counts = np.bincount(inv, minlength=len(uniq)).astype(np.float64)
-        for c in range(sig_valid.shape[1]):
-            collapsed[:, c] = np.bincount(inv, weights=sig_valid[:, c], minlength=len(uniq)) / counts
-        t_valid, sig_valid = uniq, collapsed
-    if len(t_valid) < 2:
-        return None
-
-    grid = t0 + np.arange(WIN_LEN) / TARGET_FPS
-    # The valid data should cover the grid, but frames never land exactly on t0 /
-    # t0+WINDOW_SEC, so the data can miss each edge by up to ~one frame interval purely
-    # from sampling offset. Rejecting on any gap (the old strict "> 1e-9" test) threw out
-    # almost every window whose t0 fell between two frames — i.e. all but the first. Allow
-    # a one-frame tolerance based on the DATA's real spacing (the clip may run below
-    # TARGET_FPS — e.g. a 24 fps webcam — so 1/TARGET_FPS would be too tight); genuine
-    # missing data is caught earlier by the gap thresholds. Then clamp the few boundary
-    # grid points into the data span so PCHIP never truly extrapolates. Interior points —
-    # the whole window bar the two ends — are unchanged, so the signal is neither moved
-    # nor stretched.
-    data_dt = float(np.median(np.diff(t_valid))) if len(t_valid) > 1 else 1.0 / TARGET_FPS
-    tol = 1.5 * data_dt
-    if t_valid[0] > grid[0] + tol or t_valid[-1] < grid[-1] - tol:
-        return None
-    grid = np.clip(grid, t_valid[0], t_valid[-1])
-    out = np.empty((WIN_LEN, sig_valid.shape[1]), dtype=np.float64)
-    for c in range(sig_valid.shape[1]):
-        out[:, c] = PchipInterpolator(t_valid, sig_valid[:, c])(grid)
-    return out
-
-
-def process_clip(task):
-    name, sig_path, out_dir, overwrite = task
-    log = []
-    spans = []
-    try:
-        d = np.load(sig_path)
-        signals = d["signals"]                       # (R, T, 3)
-        if "timestamps" not in getattr(d, "files", []):
-            return name, f"{name}: no timestamps in npz, skip", 0, spans
-        ts = np.asarray(d["timestamps"], dtype=np.float64)   # absolute seconds
-        R, T, C = signals.shape
-        if T < 4 or len(ts) < T:
-            return name, f"{name}: too short / timestamp mismatch, skip", 0, spans
-
-        has_counts = "pixel_counts" in getattr(d, "files", [])
-        pix = np.asarray(d["pixel_counts"], dtype=np.float64) if has_counts else None
-
-        ts0 = float(ts[0])
-        t = ts[:T] - ts0
-        valid = np.all(np.isfinite(signals[:, :, 1]), axis=0)
-        dts = np.diff(t)
-        median_dt = float(np.median(dts)) if len(dts) else 1.0 / TARGET_FPS
-        total = float(t[-1]) if T else 0.0
-        n_valid_frames = int(valid.sum())
-
-        # --- RELAXED TEST MODE -------------------------------------------------------
-        # Goal: get at least one window from (almost) any clip so a custom dataset can be
-        # smoke-tested end to end. Two relaxations vs the strict pipeline:
-        #  (1) adaptive window length: if the clip is shorter than WINDOW_SEC, shrink the
-        #      window to what the clip actually spans (down to RELAX_MIN_WINDOW_SEC) so a
-        #      ~20 s clip still yields a window even when WINDOW_SEC is 20.
-        #  (2) best-effort fill: NaN gaps inside the chosen span are interpolated over
-        #      rather than rejected, so partially-tracked clips still produce a window.
-        # A clip is only skipped if it has essentially NO valid signal at all.
-        min_win = getattr(config, "RELAX_MIN_WINDOW_SEC", 8.0)
-        min_valid_frac = getattr(config, "RELAX_MIN_VALID_FRAC", 0.10)  # need at least this much signal
-
-        if n_valid_frames < 4 or (n_valid_frames / max(1, T)) < min_valid_frac:
-            log.append(f"{name}: SKIP — only {100*np.mean(valid):.0f}% valid "
-                       f"({n_valid_frames}/{T} frames), below {100*min_valid_frac:.0f}% floor")
-            return name, "\n".join(log), 0, spans
-
-        # window length actually used for THIS clip: full WINDOW_SEC if it fits, else the
-        # clip span (so short ICU clips are not thrown away). Never below min_win.
-        # IMPORTANT: the OUTPUT is always WIN_LEN (600) samples regardless of the real
-        # duration, because the HR model's spectral grid is fixed to that length. A shorter
-        # real span is simply resampled to 600 points (its effective fps differs, but for a
-        # smoke test that is fine; the stored fps stays TARGET_FPS for downstream sanity).
-        eff_window = WINDOW_SEC if total + 1e-9 >= WINDOW_SEC else max(min_win, total * 0.98)
-        eff_win_len = WIN_LEN                       # ALWAYS 600 so the model can consume it
-        eff_step = STEP_SEC if STEP_SEC < eff_window else eff_window  # keep overlap sane
-
-        emitted = 0
-        t0 = 0.0
-        made_any = False
-        while t0 + eff_window <= total + 1e-9:
-            lo = np.searchsorted(t, t0, side="left")
-            hi = np.searchsorted(t, t0 + eff_window, side="right")
-            t_win = t[lo:hi]
-            valid_win = valid[lo:hi]
-            if valid_win.sum() < 4:
-                t0 += eff_step
-                continue
-
-            # best-effort: resample using ONLY the valid samples in this span; np.interp /
-            # PCHIP fill the NaN gaps. We do NOT reject on gap length in relaxed mode.
-            vmask = valid_win
-            tv = t_win[vmask]
-            grid = t0 + np.arange(eff_win_len) / TARGET_FPS
-            grid = np.clip(grid, tv[0], tv[-1])          # no extrapolation
-            resampled = np.empty((R, eff_win_len, C), dtype=np.float32)
-            ok = True
-            for r in range(R):
-                sv = signals[r, lo:hi, :][vmask, :]      # (n_valid, C)
-                if len(tv) < 2:
-                    ok = False
-                    break
-                # collapse duplicate timestamps for PCHIP
-                tvu, sv_u = tv, sv
-                if np.any(np.diff(tv) <= 0):
-                    uniq, inv = np.unique(tv, return_inverse=True)
-                    sv_u = np.empty((len(uniq), C))
-                    cnt = np.bincount(inv, minlength=len(uniq)).astype(float)
-                    for c in range(C):
-                        sv_u[:, c] = np.bincount(inv, weights=sv[:, c], minlength=len(uniq)) / cnt
-                    tvu = uniq
-                for c in range(C):
-                    resampled[r, :, c] = PchipInterpolator(tvu, sv_u[:, c])(grid).astype(np.float32)
-            if not ok:
-                t0 += eff_step
-                continue
-
-            counts_rs = None
-            if pix is not None:
-                counts_rs = np.empty((R, eff_win_len), dtype=np.float32)
-                for r in range(R):
-                    pv = pix[r, lo:hi][vmask]
-                    counts_rs[r] = np.interp(grid, tv, pv).astype(np.float32)
-
-            emitted += 1
-            made_any = True
-            seg_name = f"{name}_{emitted}"
-            out_path = os.path.join(out_dir, f"{seg_name}_signals.npz")
-            if overwrite or not os.path.exists(out_path):
-                if counts_rs is not None:
-                    np.savez_compressed(out_path, signals=resampled, fps=np.float32(TARGET_FPS),
-                                        pixel_counts=counts_rs)
-                else:
-                    np.savez_compressed(out_path, signals=resampled, fps=np.float32(TARGET_FPS))
-            spans.append(dict(segment=seg_name, clip=name, index=emitted,
-                              t_start=round(float(t0), 3), t_end=round(float(t0 + eff_window), 3),
-                              abs_start=round(float(ts0 + t0), 6)))
-            t0 += eff_step
-
-        # GUARANTEE at least one window: if the sliding loop produced nothing (e.g. the
-        # clip is a hair shorter than eff_window, or gaps kept nudging past the end), emit
-        # a single best-effort window over the clip's entire valid span.
-        if not made_any:
-            vidx = np.where(valid)[0]
-            tv = t[vidx]
-            if len(tv) >= 2:
-                grid = np.linspace(tv[0], tv[-1], eff_win_len)
-                resampled = np.empty((R, eff_win_len, C), dtype=np.float32)
-                good = True
-                for r in range(R):
-                    sv = signals[r, vidx, :]
-                    tvu, sv_u = tv, sv
-                    if np.any(np.diff(tv) <= 0):
-                        uniq, inv = np.unique(tv, return_inverse=True)
-                        sv_u = np.empty((len(uniq), C))
-                        cnt = np.bincount(inv, minlength=len(uniq)).astype(float)
-                        for c in range(C):
-                            sv_u[:, c] = np.bincount(inv, weights=sv[:, c], minlength=len(uniq)) / cnt
-                        tvu = uniq
-                    if len(tvu) < 2:
-                        good = False
-                        break
-                    for c in range(C):
-                        resampled[r, :, c] = PchipInterpolator(tvu, sv_u[:, c])(grid).astype(np.float32)
-                if good:
-                    counts_rs = None
-                    if pix is not None:
-                        counts_rs = np.empty((R, eff_win_len), dtype=np.float32)
-                        for r in range(R):
-                            counts_rs[r] = np.interp(grid, tv, pix[r, vidx]).astype(np.float32)
-                    emitted += 1
-                    seg_name = f"{name}_{emitted}"
-                    out_path = os.path.join(out_dir, f"{seg_name}_signals.npz")
-                    if overwrite or not os.path.exists(out_path):
-                        if counts_rs is not None:
-                            np.savez_compressed(out_path, signals=resampled, fps=np.float32(TARGET_FPS),
-                                                pixel_counts=counts_rs)
-                        else:
-                            np.savez_compressed(out_path, signals=resampled, fps=np.float32(TARGET_FPS))
-                    spans.append(dict(segment=seg_name, clip=name, index=emitted,
-                                      t_start=round(float(tv[0]), 3), t_end=round(float(tv[-1]), 3),
-                                      abs_start=round(float(ts0 + tv[0]), 6)))
-
-        log.append(f"{name}: {emitted} window(s) from {total:.1f}s "
-                   f"(win={eff_window:.0f}s, {100*np.mean(valid):.0f}% frames valid, "
-                   f"median {1/median_dt:.1f} fps)")
-        return name, "\n".join(log), emitted, spans
-    except Exception as exc:
-        return name, f"{name}: ERROR {type(exc).__name__}: {exc}", 0, spans
-
-
-def _default_workers():
     try:
         return len(os.sched_getaffinity(0))
     except AttributeError:
         return os.cpu_count() or 1
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Build clean uniform 20 s windows from extracted signals.")
+def _write_manifest(windows: list[WindowInfo], output_dir: str) -> None:
+    """
+    Save metadata describing every emitted dataset window.
+
+    The manifest preserves the correspondence between generated training
+    samples and their original locations within each source clip.
+
+    Args:
+        windows: Metadata for all emitted windows.
+        output_dir: Dataset output directory.
+    """
+    windows.sort(key=lambda window: (window.clip, window.index))
+
+    manifest_path = os.path.join(output_dir, "segments_manifest.csv")
+
+    with open(manifest_path, "w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+
+        writer.writerow([
+            "segment",
+            "clip",
+            "index",
+            "t_start",
+            "t_end",
+            "abs_start",
+        ])
+
+        for window in windows:
+            writer.writerow([
+                window.segment,
+                window.clip,
+                window.index,
+                window.t_start,
+                window.t_end,
+                window.abs_start,
+            ])
+
+
+def process_dataset(task: DatasetTask) -> DatasetResult:
+    """
+    Process a single extracted signal archive.
+
+    Performs:
+        - window selection
+        - signal interpolation
+        - dataset generation
+
+    Args:
+        task: Processing task describing the input archive and output location.
+
+    Returns:
+        Processing result for the archive.
+    """
+    messages: list[str] = []
+    windows: list[WindowInfo] = []
+
+    try:
+        # Load extracted signals.
+        data = np.load(task.signal_path)
+        signals = data["signals"]
+        timestamps = data["timestamps"]
+        pixel_counts = data["pixel_counts"]
+
+        # A facial region is valid only when all three RGB channels are finite.
+        valid_regions = np.isfinite(signals).all(axis=-1)
+
+        # Generate candidate dataset windows.
+        windows = find_windows(task.name, timestamps, valid_regions)
+
+        # Nothing to emit.
+        if not windows:
+            return DatasetResult(
+                name=task.name,
+                log=f"{task.name}: no valid windows.",
+                windows=[],
+                count=0,
+                success=True
+            )
+
+        messages.append(f"{task.name}: {len(windows)} window(s)")
+
+        absolute_windows: list[WindowInfo] = []
+        # Process each accepted window.
+        for window in windows:
+            output_path = os.path.join(task.output_dir, f"{window.segment}{FileExtension.DATASET_SAMPLE}")
+
+            # Locate the source samples corresponding to the selected interval.
+            first = np.searchsorted(timestamps, window.abs_start, side="left")
+            last = np.searchsorted(timestamps, window.abs_start + config.WINDOW_SEC, side="right")
+
+            window_times = timestamps[first:last]
+            window_signals = signals[first:last]
+            window_counts = pixel_counts[first:last]
+
+            # Construct the target uniformly sampled timeline.
+            output_times = (
+                window.abs_start
+                + np.arange(0.0, config.WINDOW_SEC, 1.0 / config.TARGET_FPS, dtype=np.float64)
+            )
+
+            # Interpolate RGB signals.
+            resampled_signals = resample_region_signals(window_signals, window_times, output_times)
+            # Interpolate quality metadata.
+            resampled_pixel_counts = resample_pixel_counts(window_counts, window_times, output_times)
+
+            # Mark rejected facial regions as unavailable.
+            resampled_signals[:, ~window.region_mask] = np.nan
+            resampled_pixel_counts[:, ~window.region_mask] = np.nan
+
+            # Save the generated dataset sample.
+            np.savez_compressed(
+                output_path,
+                signals=resampled_signals,
+                pixel_counts=resampled_pixel_counts,
+                region_mask=window.region_mask,
+                fps=np.float32(config.TARGET_FPS)
+            )
+            absolute_windows.append(window)
+
+        return DatasetResult(
+            name=task.name,
+            log="\n".join(messages),
+            windows=absolute_windows,
+            count=len(absolute_windows),
+            success=True
+        )
+
+    except Exception as exc:
+        return DatasetResult(
+            name=task.name,
+            log=f"{task.name}: ERROR {type(exc).__name__}: {exc}",
+            windows=[],
+            count=0,
+            success=False
+        )
+
+
+# ============================================================================
+# Command line interface
+# ============================================================================
+def main() -> None:
+    """
+    Generate uniformly sampled dataset windows from extracted rPPG signals.
+    """
+    # Parse arguments.
+    ap = argparse.ArgumentParser(
+        description=("Generate fixed-length training windows from extracted rPPG signals.")
+    )
     ap.add_argument("--signals-dir", default="output/signals")
-    ap.add_argument("--out-dir", default="output/windows")
-    ap.add_argument("--overwrite", action="store_true")
-    ap.add_argument("--workers", type=int, default=0, help="0 = all CPU cores")
+    ap.add_argument("--out-dir", default="output/dataset")
+    ap.add_argument("--workers", type=int, default=0,
+        help="Number of worker processes (0 = all available cores)."
+    )
     args = ap.parse_args()
 
+    # Create the output directory.
     os.makedirs(args.out_dir, exist_ok=True)
-    sig_files = sorted(f for f in os.listdir(args.signals_dir) if f.endswith("_signals.npz"))
-    print(f"{len(sig_files)} signal file(s) in {args.signals_dir}")
-    print(f"window {WINDOW_SEC:.0f}s @ {TARGET_FPS:.0f}Hz = {WIN_LEN} samples | "
-          f"max gap {MAX_GAP_SEC}s, max total broken {MAX_TOTAL_BROKEN_SEC}s")
 
-    tasks = [(f[:-len("_signals.npz")], os.path.join(args.signals_dir, f), args.out_dir, args.overwrite)
-             for f in sig_files]
+    # List available signal archives.
+    signal_files: list[str] = sorted(
+        file for file in os.listdir(args.signals_dir) if file.endswith(FileExtension.SIGNALS) # type: ignore
+    )
+    print(f"Loaded {len(signal_files)} signal archive(s)")
+
+    # Build one processing task per signal archive.
+    tasks: list[DatasetTask] = []
+    extension_length = len(FileExtension.SIGNALS)
+    for signal_file in signal_files:
+        name = signal_file[:-extension_length]
+        tasks.append(
+            DatasetTask(
+                name=name,
+                signal_path=os.path.join(args.signals_dir, signal_file),
+                output_dir=args.out_dir
+            )
+        )
+
+    # Exit if no signal archives are available.
     if not tasks:
-        print("nothing to process.")
+        print("Tasks not generated. Nothing to process.")
         return
 
-    n_workers = args.workers if args.workers and args.workers > 0 else _default_workers()
-    n_workers = max(1, min(n_workers, len(tasks)))
+    # Launch worker processes.
+    workers = min(args.workers if args.workers > 0 else _default_workers(), len(tasks))
+    print(f"Processing {len(tasks)} signal archive(s) with {workers} worker(s)")
+
+    manifest: list[WindowInfo] = []
     total_windows = 0
-    all_spans = []
-    if n_workers == 1:
-        for i, task in enumerate(tasks, 1):
-            _, msg, k, spans = process_clip(task)
-            total_windows += k
-            all_spans.extend(spans)
-            print(f"[{i}/{len(tasks)}] {msg}")
-    else:
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            futures = {pool.submit(process_clip, t): t[0] for t in tasks}
-            for i, fut in enumerate(as_completed(futures), 1):
-                _, msg, k, spans = fut.result()
-                total_windows += k
-                all_spans.extend(spans)
-                print(f"[{i}/{len(tasks)}] {msg}")
 
-    # manifest: one row per emitted segment with its real time span (for PPG labeling)
-    import csv
-    man_path = os.path.join(args.out_dir, "segments_manifest.csv")
-    all_spans.sort(key=lambda r: (r["clip"], r["index"]))
-    with open(man_path, "w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=["segment", "clip", "index", "t_start", "t_end", "abs_start"])
-        w.writeheader()
-        w.writerows(all_spans)
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(process_dataset, task): task.name for task in tasks}
 
-    print(f"\ntotal windows written: {total_windows} -> {args.out_dir}")
-    print(f"manifest ({len(all_spans)} segments) -> {man_path}")
+        # Report completed tasks as workers finish.
+        for index, future in enumerate(as_completed(futures), 1):
+            result = future.result()
+            manifest.extend(result.windows)
+            total_windows += result.count
+            print(f"[{index}/{len(tasks)}] {result.log}")
+
+    # Save dataset metadata.
+    _write_manifest(manifest, args.out_dir)
+    print(f"\nGenerated {total_windows} dataset window(s)")
+    print(f"Manifest -> {os.path.join(args.out_dir, 'segments_manifest.csv')}")
 
 
 if __name__ == "__main__":

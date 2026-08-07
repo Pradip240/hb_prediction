@@ -29,18 +29,6 @@ services:
   #             capabilities: [gpu]
   #   command: ["--input-dir", "/data/videos", "--output-dir", "/output/landmarks"]
 
-  signal_analysis:
-    image: rppg-base
-    container_name: signal-analysis
-    volumes:
-      - ./data:/data:ro
-      - ./output:/output
-      - ./common:/app/common:ro
-      - ./signal_analysis:/app/signal_analysis:ro
-    command: ["python", "signal_analysis/analyze_signals.py",
-              "--video-dir", "/data/videos", "--seg-dir", "/output/seg", "--landmarks-dir", "/output/landmarks",
-              "--signals-dir", "/output/signals", "--plots-dir", "/output/plots", "--workers", "4"]
-
   # signal_analysis:
   #   image: rppg-base
   #   container_name: signal-analysis
@@ -51,19 +39,19 @@ services:
   #     - ./signal_analysis:/app/signal_analysis:ro
   #   command: ["python", "signal_analysis/analyze_signals.py",
   #             "--video-dir", "/data/videos", "--seg-dir", "/output/seg", "--landmarks-dir", "/output/landmarks",
-  #             "--signals-dir", "/output/signals", "--plots-dir", "/output/plots", "--workers", "4",
-  #             "--fps-sidecar", "/output/mcd_fps.csv", "--no-plot", "--no-video"]
+  #             "--signals-dir", "/output/signals", "--plots-dir", "/output/plots",
+  #             "--no-plot", "--no-video", "--overwrite", "--workers", "4"]
 
-  # prepare_dataset:
-  #   image: rppg-base
-  #   container_name: prepare-dataset
-  #   volumes:
-  #     - ./data:/data:ro
-  #     - ./output:/output
-  #     - ./common:/app/common:ro
-  #     - ./prepare_dataset:/app/prepare_dataset:ro
-  #   command: ["python", "prepare_dataset/prepare_dataset.py", "--signals-dir", "/output/signals_icu",
-  #             "--out-dir", "/output/train_data_icu", "--workers", "8"]
+  prepare_dataset:
+    image: rppg-base
+    container_name: prepare-dataset
+    volumes:
+      - ./data:/data:ro
+      - ./output:/output
+      - ./common:/app/common:ro
+      - ./prepare_dataset:/app/prepare_dataset:ro
+    command: ["python", "-m", "prepare_dataset.prepare_dataset", "--signals-dir", "/output/signals",
+              "--out-dir", "/output/dataset", "--workers", "4"]
 
   # hr_training:
   #   image: rppg-base

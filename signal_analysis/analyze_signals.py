@@ -335,7 +335,6 @@ def main() -> None:
             no_video=args.no_video,
             overwrite=args.overwrite,
         ))
-        break
 
     # Exit if no clips are available
     if not tasks:
