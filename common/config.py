@@ -62,11 +62,7 @@ REGIONS = {
 }
 
 # Fixed region order used throughout the pipeline.
-REGION_ORDER = (
-    "forehead",
-    "lcheek",
-    "rcheek",
-)
+REGION_ORDER = ("forehead", "lcheek", "rcheek")
 
 # Face-parsing class IDs treated as skin.
 #
@@ -114,6 +110,12 @@ REGION_COLORS = {
 OVERLAY_SKIN_TINT_ALPHA = 0.25
 OVERLAY_REGION_FILL_ALPHA = 0.35
 
+# Colors used to distinguish classical rPPG methods in plots.
+RPPG_METHOD_COLORS = {
+    "POS": "tab:blue",
+    "CHROM": "tab:orange",
+    "green": "tab:green",
+}
 
 
 # ============================================================================
@@ -126,7 +128,7 @@ WINDOW_SEC = 20.0
 # Step between consecutive windows (seconds).
 #
 # Set equal to WINDOW_SEC for non-overlapping windows.
-WINDOW_STEP_SEC = 20.0
+WINDOW_STEP_SEC = 15
 
 # Minimum number of facial regions that must satisfy the quality criteria for a window to be accepted.
 MIN_VALID_REGIONS = 1
@@ -146,27 +148,55 @@ TARGET_FPS = 15
 
 
 
+# ============================================================================
+# Region weighting
+# ============================================================================
 
-
-
-
-
-
-
-
-# --- size-aware region weighting --------------------------------------------------
-# When the 3 regions are combined into one signal, weight each by its skin-pixel count
-# so a tiny sliver (e.g. a turned-away cheek at ~20 px) doesn't contribute equally to a
-# solid region (~1900 px) whose mean is far less noisy. Floor/cap scheme: a region below
-# MIN_SKIN_PIXELS gets weight 0; above that, weight = pixel count clipped to
-# REGION_WEIGHT_CAP_PX. Applied PER SAMPLE, so it tracks head turns (a cheek that becomes
-# a sliver mid-window loses weight at that moment). Set REGION_WEIGHT_ENABLED = False for
-# an equal-weight nanmean fallback.
+# Enable skin-pixel-count weighting when combining facial regions.
 REGION_WEIGHT_ENABLED = True
-REGION_WEIGHT_CAP_PX = 1000        # counts above this are clipped (diminishing returns on size)
-REGION_WEIGHT_SMOOTH_SEC = 1.0     # low-pass the count series before weighting: keeps slow pose
-                                   # drift, drops fast flicker so the weight can't inject pulse-band
-                                   # noise. 0 = no smoothing.
+
+# Temporal smoothing duration for region pixel counts before calculating weights.
+#
+# Smoothing reduces rapid changes in region size caused by segmentation noise
+# while preserving slower changes caused by head movement.
+REGION_WEIGHT_SMOOTH_SEC = 1.0
+
+
+
+# ============================================================================
+# rPPG signal processing
+# ============================================================================
+
+# Duration of the sliding window used by the POS algorithm (seconds).
+POS_WINDOW_SEC = 1.6
+
+# Physiological heart-rate frequency range used by rPPG algorithms (Hz).
+HR_FREQ_MIN_HZ = 0.83    # ~50 BPM
+HR_FREQ_MAX_HZ = 2.8     # ~168 BPM
+
+# Order of the Butterworth bandpass filter used by CHROM and other signal-processing methods.
+BANDPASS_ORDER = 3
+
+# Smoothness-prior parameter used to remove low-frequency baseline drift.
+#
+# Larger values produce a smoother estimated baseline and therefore remove
+# slower variations more aggressively.
+DETREND_LAMBDA = 10.0
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -180,19 +210,10 @@ FPS_SANITY_MAX = 1000.0    # ...or above this (guards absurd headers like 30000)
 PTS_MIN_FINITE_FRAC = 0.5  # a PTS stream needs at least this fraction finite to be used
 
 
-
-# Physiological heart-rate passband (Hz).
-HR_FREQ_MIN_HZ = 0.83     # ~50 BPM
-HR_FREQ_MAX_HZ = 2.8      # ~168 BPM
-
 # Extended band for spectrum analysis / de Haan SNR (Hz).
 SPEC_FREQ_MIN_HZ = 0.7
 SPEC_FREQ_MAX_HZ = 4.5
 
-# Smoothness-priors detrending regularisation (Tarvainen et al.).
-DETREND_LAMBDA = 50.0
-# Butterworth bandpass order.
-BANDPASS_ORDER = 4
 
 # Gating / quality-control thresholds.
 AGREE_TOLERANCE_BPM = 6.0

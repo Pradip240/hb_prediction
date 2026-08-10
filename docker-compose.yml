@@ -51,6 +51,7 @@ services:
       - ./common:/app/common:ro
       - ./prepare_dataset:/app/prepare_dataset:ro
     command: ["python", "-m", "prepare_dataset.prepare_dataset", "--signals-dir", "/output/signals",
+              "--ppg-dir", "/data/ppg", "--ground-truth", "/data/ground_truth.csv",
               "--out-dir", "/output/dataset", "--workers", "4"]
 
   # hr_training:
@@ -101,11 +102,9 @@ services:
   #     - ./prediction:/app/prediction:ro
   #     - ./hr_training:/app/hr_training:ro
   #     - ./hb_training:/app/hb_training:ro
-  #   # command: ["python", "prediction/predict.py", "--segments-dir", "/output/train_data",
-  #   #           "--ppg-dir", "/data/ppg", "--ground-truth", "/data/ground_truth.csv", "--out-dir", "/output/prediction",
-  #   command: ["python", "prediction/predict.py", "--segments-dir", "/output/train_data_icu",
-  #             "--ppg-dir", "/data/ppg", "--ground-truth", "/data/ground_truth_icu.csv", "--out-dir", "/output/prediction_icu",
-  #             "--hr-model", "/output/hr_model/hr_model.pt", "--hb-model", "/output/hb_model/hb_model.pt",
+  #   command: ["python", "-m", "prediction.predict", "--dataset-dir", "/output/dataset",
+  #             "--ppg-dir", "/data/ppg", "--ground-truth", "/data/ground_truth.csv", "--out-dir", "/output/prediction",
+  #             # "--hr-model", "/output/hr_model/hr_model.pt", "--hb-model", "/output/hb_model/hb_model.pt",
   #             "--workers", "4"]
 
 #   docker compose run --rm segmentation

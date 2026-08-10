@@ -115,7 +115,7 @@ class WindowInfo:
         t_start: Window start time relative to the clip.
         t_end: Window end time relative to the clip.
         abs_start: Absolute timestamp of the window start.
-        region_mask: Boolean mask indicating valid facial regions.
+        region_mask: Optional Boolean mask indicating valid facial regions.
     """
     segment: str
     clip: str
@@ -123,7 +123,7 @@ class WindowInfo:
     t_start: float
     t_end: float
     abs_start: float
-    region_mask: np.ndarray
+    region_mask: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -143,3 +143,124 @@ class DatasetResult:
     windows: list[WindowInfo]
     count: int
     success: bool
+
+
+
+# ============================================================================
+# Prediction
+# ============================================================================
+@dataclass(slots=True, frozen=True)
+class PPGSignal:
+    """
+    PPG signal and timing information.
+
+    Attributes:
+        samples: PPG samples.
+        sampling_frequency: Sampling frequency in Hz.
+        start_timestamp: Absolute start timestamp in seconds.
+    """
+    samples: np.ndarray
+    sampling_frequency: float
+    start_timestamp: float
+
+
+@dataclass(slots=True, frozen=True)
+class PredictionTask:
+    """
+    Input required to process a single dataset sample.
+
+    Attributes:
+        name: Dataset sample name.
+        sample_path: Path to the dataset sample archive.
+        segment: Source clip and time span metadata.
+        ppg_info: Reference PPG data for the sample's subject and state.
+        output_dir: Directory where prediction outputs are written.
+        no_plot: Whether prediction plotting is disabled.
+        hr_model: Path to the optional trained HR model.
+        hb_model: Path to the optional trained Hb model.
+        hb_true: Ground-truth hemoglobin value for the subject.
+        pulse_hr: Ground-truth pulse value used when no PPG is available.
+    """
+    name: str
+    sample_path: str
+    segment: WindowInfo | None
+    ppg_info: PPGSignal | None
+    output_dir: str
+    no_plot: bool
+    hr_model: str | None
+    hb_model: str | None
+    hb_true: float | None
+    pulse_hr: float | None
+
+
+@dataclass(slots=True, frozen=True)
+class PredictionRecord:
+    """
+    Prediction values for a single dataset sample.
+
+    Attributes:
+        segment: Dataset sample name.
+        clip: Source clip name.
+        t_start: Segment start time.
+        t_end: Segment end time.
+        hr_pos: POS-based heart rate.
+        conf_pos: POS confidence.
+        hr_chrom: CHROM-based heart rate.
+        conf_chrom: CHROM confidence.
+        hr_green: Green-channel heart rate.
+        conf_green: Green-channel confidence.
+        hr_label: Ground-truth heart rate.
+        hr_model: Trained HR model prediction.
+        hr_model_conf: Trained HR model confidence.
+        hb_pred: Trained hemoglobin model prediction.
+        hb_model_conf: Trained hemoglobin model confidence.
+        hb_true: Ground-truth hemoglobin value.
+    """
+    segment: str
+    clip: str
+    t_start: float
+    t_end: float
+    hr_pos: float | None
+    conf_pos: float | None
+    hr_chrom: float | None
+    conf_chrom: float | None
+    hr_green: float | None
+    conf_green: float | None
+    hr_label: float | None
+    hr_model: float | None
+    hr_model_conf: float | None
+    hb_pred: float | None
+    hb_model_conf: float | None
+    hb_true: float | None
+
+
+@dataclass(slots=True, frozen=True)
+class PredictionResult:
+    """
+    Result returned after processing a single dataset sample.
+
+    Attributes:
+        name: Dataset sample name.
+        prediction: Prediction values for the sample.
+        success: True if processing completed successfully, otherwise False.
+        error: Error message when processing fails.
+    """
+    name: str
+    prediction: PredictionRecord | None
+    success: bool
+    error: str | None
+
+
+@dataclass(slots=True, frozen=True)
+class WaveformResult:
+    """
+    Pulse waveform and heart-rate estimate.
+
+    Attributes:
+        waveform: Extracted pulse waveform.
+        heart_rate: Estimated heart rate in BPM.
+        confidence: Confidence of the heart-rate estimate.
+    """
+    waveform: np.ndarray
+    heart_rate: float | None
+    confidence: float

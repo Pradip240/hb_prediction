@@ -1,12 +1,26 @@
-"""Shared processing library for the CPU stages.
+"""Shared signal-processing utilities for the CPU pipeline.
 
-Two sections:
-  1. Region extraction — turn the saved segmentation + landmarks into a per-region
-     skin mask and mean RGB (the original tracker's region-selection logic).
-     Used by signal_extraction and by the visualization overlay, so both agree.
-  2. rPPG DSP — detrend, bandpass, POS/CHROM projection, clean-window search.
-     Used by the HR / Hb stages.
+The module is divided into three stages:
+
+1. Landmark and mask processing
+   * Smooth facial landmarks.
+   * Convert face-parsing output into skin masks.
+   * Build and smooth facial-region masks.
+
+2. Region signal extraction
+   * Extract mean RGB values and valid pixel counts from each region.
+   * Combine multiple facial regions into a single RGB signal when required.
+
+3. rPPG signal processing
+   * Remove low-frequency baseline drift.
+   * Apply physiological bandpass filtering.
+   * Estimate heart rate and spectral confidence from a pulse waveform.
+
+The same functions are used by signal extraction, visualization, and
+downstream HR processing so that all stages operate on consistent region
+definitions and signal-processing logic.
 """
+
 
 import cv2
 import numpy as np
@@ -18,6 +32,10 @@ from common import config
 from common.one_euro import OneEuroFilter
 
 
+
+# ---------------------------------------------------------------------------
+# Landmark and mask processing
+# ---------------------------------------------------------------------------
 def smooth_landmarks(pts_xy: NDArray[np.float64], fps: float) -> NDArray[np.float64]:
     """
     Apply One-Euro temporal smoothing to face landmarks.
@@ -179,6 +197,10 @@ def build_region_masks(
     return region_masks
 
 
+
+# ---------------------------------------------------------------------------
+# Region signal extraction
+# ---------------------------------------------------------------------------
 def region_mean_rgb_count(
     frame_bgr: MatLike,
     region_masks: NDArray[np.uint8],
@@ -219,215 +241,168 @@ def region_mean_rgb_count(
     return mean_rgb, pixel_counts
 
 
-def combine_regions(signals, pixel_counts=None, fps=None):
-    """Combine per-region signals (R, T, C) into one (T, C) signal.
-
-    If REGION_WEIGHT_ENABLED and pixel_counts (R, T) are given, each region is weighted
-    PER SAMPLE by its skin-pixel count under a floor/cap scheme: weight 0 below
-    MIN_SKIN_PIXELS, else min(count, REGION_WEIGHT_CAP_PX). Because the weight is per
-    sample, it tracks head movement within a window — when the head turns and a cheek
-    shrinks from a solid region to a sliver, that cheek's weight falls at that moment and
-    the still-solid regions take over. The count series is first low-pass smoothed
-    (REGION_WEIGHT_SMOOTH_SEC) so slow pose drift is kept but any residual fast flicker
-    can't modulate the combined signal in the pulse band. NaN region-samples never
-    contribute. Falls back to an equal-weight nanmean when weighting is disabled or counts
-    are unavailable.
+def combine_regions(signals: np.ndarray, pixel_counts: np.ndarray, fps: float) -> np.ndarray:
     """
-    signals = np.asarray(signals, dtype=np.float64)     # (R, T, C)
-    R, T, C = signals.shape
+    Combine per-region RGB signals into one RGB signal.
 
-    if not getattr(config, "REGION_WEIGHT_ENABLED", False) or pixel_counts is None:
-        return np.nanmean(signals, axis=0)              # equal-weight fallback
+    Args:
+        signals: RGB signals with shape (T, R, 3).
+        pixel_counts: Valid skin-pixel counts with shape (T, R).
+        fps: Sampling frequency of the signals.
 
-    counts = np.asarray(pixel_counts, dtype=np.float64)  # (R, T)
+    Returns:
+        Combined RGB signal with shape (T, 3).
+    """
+    signals = np.asarray(signals, dtype=np.float64)
+    pixel_counts = np.asarray(pixel_counts, dtype=np.float64)
 
-    # smooth each region's count series to keep pose drift but drop fast flicker
-    smooth_sec = getattr(config, "REGION_WEIGHT_SMOOTH_SEC", 0.0)
-    fps = fps or getattr(config, "TARGET_FPS", config.DEFAULT_FPS)
-    win = int(round(smooth_sec * fps)) if smooth_sec and smooth_sec > 0 else 0
-    if win >= 2 and T >= win:
-        kernel = np.ones(win) / win
-        counts = np.vstack([np.convolve(counts[r], kernel, mode="same") for r in range(R)])
+    # Fall back to equal-weight averaging when region weighting is disabled.
+    if not config.REGION_WEIGHT_ENABLED:
+        return np.nanmean(signals, axis=1)
 
-    floor = config.MIN_SKIN_PIXELS
-    cap = getattr(config, "REGION_WEIGHT_CAP_PX", 1000)
-    w = np.where(counts >= floor, np.minimum(counts, cap), 0.0)   # (R, T)
-    valid = np.isfinite(signals[:, :, 1])                # (R, T) — region can't contribute where NaN
-    w = w * valid
-    w3 = w[:, :, None]                                    # (R, T, 1) broadcast over C
+    # Smooth pixel counts to reduce fast fluctuations in region weights.
+    window = int(round(config.REGION_WEIGHT_SMOOTH_SEC * fps))
+    n_frames = signals.shape[0]
+    if (window >= 2) and (n_frames >= window):
+        kernel = np.ones(window) / window
+        pixel_counts = np.stack(
+            [np.convolve(pixel_counts[:, region], kernel, mode="same") for region in range(pixel_counts.shape[1])],
+            axis=1
+        )
 
-    wsum = w.sum(axis=0)                                  # (T,)
-    num = np.nansum(np.where(np.isfinite(signals), signals, 0.0) * w3, axis=0)  # (T, C)
-    out = np.divide(num, wsum[:, None], out=np.full((T, C), np.nan), where=wsum[:, None] > 0)
-    return out
-
-
-# ======================================================================
-# 2. rPPG DSP  (used by the HR / Hb stages)
-# ======================================================================
-
-def interpolate_nans(sig: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Linearly interpolates NaN values in a 1D or 2D time-series array."""
-    sig_clean = np.asarray(sig, dtype=np.float64).copy()
-    if sig_clean.ndim == 1:
-        valid = np.isfinite(sig_clean)
-        if valid.sum() >= 2 and not valid.all():
-            indices = np.arange(len(sig_clean))
-            sig_clean[~valid] = np.interp(indices[~valid], indices[valid], sig_clean[valid])
-        elif valid.sum() < 2:
-            sig_clean[~valid] = 0.0
-        return sig_clean
-    for col in range(sig_clean.shape[1]):
-        sig_clean[:, col] = interpolate_nans(sig_clean[:, col])
-    return sig_clean
+    # Compute the weighted RGB mean independently for each frame.
+    weighted_sum = np.nansum(np.where(np.isfinite(signals), signals, 0.0) * pixel_counts[:, :, None], axis=1)
+    weight_sum = pixel_counts.sum(axis=1)
+    return weighted_sum / weight_sum[:, None]
 
 
-def smoothness_detrend(sig: NDArray[np.float64], lambda_param: float = config.DETREND_LAMBDA) -> NDArray[np.float64]:
-    """Removes low-frequency baseline wander via smoothness priors (Tarvainen 2002)."""
-    sig_clean = interpolate_nans(sig)
-    n_samples = len(sig_clean)
+
+# ---------------------------------------------------------------------------
+# rPPG signal processing
+# ---------------------------------------------------------------------------
+def smoothness_detrend(signal: np.ndarray) -> np.ndarray:
+    """
+    Remove low-frequency baseline drift using smoothness priors.
+
+    Args:
+        signal: Input pulse signal.
+
+    Returns:
+        Detrended signal with the estimated baseline removed.
+    """
+    n_samples = len(signal)
+
+    # Very short signals cannot provide a meaningful second-order
+    # smoothness estimate, so only remove their mean.
     if n_samples < 5:
-        return sig_clean - np.mean(sig_clean)
+        return signal - np.mean(signal)
+
+    # Construct the second-order difference matrix used to penalize
+    # rapid changes in the estimated baseline.
     identity = np.eye(n_samples)
-    diff_matrix = np.diff(identity, n=2, axis=0)
+    difference = np.diff(identity, n=2, axis=0)
+
     try:
-        penalty = (lambda_param ** 2) * (diff_matrix.T @ diff_matrix)
-        trend = np.linalg.solve(identity + penalty, sig_clean)
+        # Solve for the smooth baseline that minimizes the signal residual
+        # while penalizing curvature in the baseline.
+        penalty = config.DETREND_LAMBDA**2 * (difference.T @ difference)
+        baseline = np.linalg.solve(identity + penalty, signal)
     except np.linalg.LinAlgError:
-        return sig_clean - np.mean(sig_clean)
-    return sig_clean - trend
+        # Fall back to mean removal if the linear system cannot be solved.
+        return signal - np.mean(signal)
+
+    # Remove the estimated low-frequency baseline from the original signal.
+    return signal - baseline
 
 
-def bandpass_filter(
-    sig: NDArray[np.float64],
-    fps: float = config.DEFAULT_FPS,
-    low_hz: float = config.HR_FREQ_MIN_HZ,
-    high_hz: float = config.HR_FREQ_MAX_HZ,
-    order: int = config.BANDPASS_ORDER,
-    apply_detrend: bool = True,
-) -> NDArray[np.float64]:
-    """Zero-phase Butterworth bandpass to isolate the physiological pulse."""
-    processed_sig = np.asarray(sig, dtype=np.float64)
+def bandpass_filter(signal: np.ndarray, fps: float, apply_detrend: bool = True) -> np.ndarray:
+    """
+    Apply a zero-phase Butterworth bandpass filter to a pulse waveform.
+
+    Args:
+        signal: Input pulse waveform.
+        fps: Sampling frequency of the signal.
+        apply_detrend: Whether to remove the slow baseline trend before filtering.
+
+    Returns:
+        Bandpass-filtered waveform. The centered input signal is returned
+        unchanged when the requested filter cannot be applied.
+    """
+    processed_signal = np.asarray(signal, dtype=np.float64)
+
+    # Remove slow baseline changes before isolating the pulse-frequency band.
     if apply_detrend:
-        processed_sig = smoothness_detrend(processed_sig)
-    processed_sig = processed_sig - np.mean(processed_sig)
+        processed_signal = smoothness_detrend(processed_signal)
+
+    # Remove the remaining DC component before filtering.
+    processed_signal -= np.mean(processed_signal)
+
+    # Normalize the cutoff frequencies to the Nyquist frequency required
+    # by scipy's Butterworth filter.
     nyquist = 0.5 * fps
-    low_norm = low_hz / nyquist
-    high_norm = min(high_hz / nyquist, 0.99)
-    if low_norm <= 0 or high_norm >= 1 or low_norm >= high_norm:
-        return processed_sig
-    b_coeff, a_coeff = butter(order, [low_norm, high_norm], btype="band")
-    if len(processed_sig) <= 3 * max(len(a_coeff), len(b_coeff)):
-        return processed_sig
-    return filtfilt(b_coeff, a_coeff, processed_sig)
+    low_normalized = config.HR_FREQ_MIN_HZ / nyquist
+    high_normalized = min(config.HR_FREQ_MAX_HZ / nyquist, 0.99)
+
+    # Return the centered signal when the requested frequency range is invalid.
+    if (low_normalized <= 0) or (high_normalized >= 1) or (low_normalized >= high_normalized):
+        return processed_signal
+
+    # Design a Butterworth bandpass filter for the physiological pulse band.
+    numerator, denominator = butter( # type: ignore
+        config.BANDPASS_ORDER, [low_normalized, high_normalized], btype="band", output="ba"
+    )
+
+    # filtfilt requires enough samples for the filter's edge padding.
+    minimum_samples = 3 * max(len(numerator), len(denominator)) # type: ignore
+    if len(processed_signal) <= minimum_samples:
+        return processed_signal
+
+    # Apply the filter in both directions to avoid introducing phase shift.
+    return filtfilt(numerator, denominator, processed_signal)
 
 
-def extract_pos(rgb_signal: NDArray[np.float64], fps: float = config.DEFAULT_FPS) -> NDArray[np.float64]:
-    """Extracts a pulse waveform using Plane-Orthogonal-to-Skin (POS)."""
-    rgb_clean = interpolate_nans(rgb_signal)
-    n_samples = rgb_clean.shape[0]
-    pulse_accum = np.zeros(n_samples)
-    win_len = int(np.round(1.6 * fps))
-    projection_matrix = np.array([[0, 1, -1], [-2, 1, 1]])
-    if win_len < 2 or n_samples < win_len:
-        mean_rgb = np.mean(rgb_clean, axis=0) + 1e-9
-        norm_rgb = rgb_clean / mean_rgb
-        s_coords = projection_matrix @ norm_rgb.T
-        alpha = np.std(s_coords[0]) / (np.std(s_coords[1]) + 1e-9)
-        pulse = s_coords[0] + alpha * s_coords[1]
-        return pulse - np.mean(pulse)
-    for start_idx in range(0, n_samples - win_len + 1):
-        window = rgb_clean[start_idx: start_idx + win_len]
-        mean_rgb = np.mean(window, axis=0) + 1e-9
-        norm_window = (window / mean_rgb).T
-        s_coords = projection_matrix @ norm_window
-        s1, s2 = s_coords[0], s_coords[1]
-        alpha = np.std(s1) / (np.std(s2) + 1e-9)
-        h_signal = s1 + alpha * s2
-        pulse_accum[start_idx: start_idx + win_len] += h_signal - np.mean(h_signal)
-    return pulse_accum - np.mean(pulse_accum)
+def spectral_hr(signal: np.ndarray, fps: float) -> tuple[float | None, float]:
+    """
+    Estimate heart rate from the dominant frequency of a pulse waveform.
 
+    Args:
+        signal: Pulse waveform.
+        fps: Sampling frequency of the waveform.
 
-def extract_chrom(rgb_signal: NDArray[np.float64], fps: float = config.DEFAULT_FPS) -> NDArray[np.float64]:
-    """Extracts a pulse waveform using Chrominance-based rPPG (CHROM)."""
-    rgb_clean = interpolate_nans(rgb_signal)
-    mean_rgb = np.mean(rgb_clean, axis=0) + 1e-9
-    norm_rgb = rgb_clean / mean_rgb
-    r_chan, g_chan, b_chan = norm_rgb[:, 0], norm_rgb[:, 1], norm_rgb[:, 2]
-    x_stride = 3.0 * r_chan - 2.0 * g_chan
-    y_stride = 1.5 * r_chan + g_chan - 1.5 * b_chan
-    x_filtered = bandpass_filter(x_stride, fps=fps, low_hz=config.SPEC_FREQ_MIN_HZ, high_hz=config.SPEC_FREQ_MAX_HZ, apply_detrend=True)
-    y_filtered = bandpass_filter(y_stride, fps=fps, low_hz=config.SPEC_FREQ_MIN_HZ, high_hz=config.SPEC_FREQ_MAX_HZ, apply_detrend=True)
-    alpha = np.std(x_filtered) / (np.std(y_filtered) + 1e-9)
-    pulse = x_filtered - alpha * y_filtered
-    return pulse - np.mean(pulse)
+    Returns:
+        Tuple containing the heart rate in BPM and peak-to-median spectral power confidence.
+    """
+    # Require at least two cycles at the lowest detectable HR.
+    minimum_samples = int(np.ceil(fps / config.HR_FREQ_MIN_HZ))
+    if len(signal) < minimum_samples or np.std(signal) < 1e-9:
+        return None, 0.0
 
+    # Remove the DC component before computing the spectrum.
+    signal = signal - np.mean(signal)
 
-def find_clean_window(
-    ref_signal: NDArray[np.float64],
-    fps: float = config.DEFAULT_FPS,
-    win_sec: float = 1.0,
-    mult: float = 3.0,
-    min_sec: float = config.MIN_CLEAN_WINDOW_SEC,
-    target_sec: float | None = None,
-) -> tuple[int, int] | None:
-    """Finds a clean, low-motion window in a raw reference signal."""
-    ref_clean = interpolate_nans(ref_signal)
-    n_samples = len(ref_clean)
-    if n_samples < int(min_sec * fps):
-        return None
+    # Apply a Hann window to reduce spectral leakage.
+    window = np.hanning(len(signal))
 
-    diff = np.abs(np.diff(ref_clean, prepend=ref_clean[0]))
-    w = max(int(round(win_sec * fps)), 3)
-    if w % 2 == 0:
-        w += 1
-    kernel = np.ones(w) / w
-    local_mean = np.convolve(diff, kernel, mode="same")
-    local_var = np.convolve(diff * diff, kernel, mode="same") - local_mean ** 2
-    local_motion = np.sqrt(np.clip(local_var, 0, None))
-    baseline = np.median(local_motion) + 1e-9
-    is_clean = local_motion <= (mult * baseline)
+    # Zero-pad the signal to improve frequency resolution.
+    nfft = int(2 ** np.ceil(np.log2(len(signal) * 4)))
 
-    rolling_mean = np.convolve(ref_clean, kernel, mode="same")
-    before = np.roll(rolling_mean, w)
-    after = np.roll(rolling_mean, -w)
-    level_change = np.abs(after - before)
-    level_change[: 2 * w] = 0.0
-    level_change[-2 * w:] = 0.0
-    lc_med = np.median(level_change)
-    lc_mad = np.median(np.abs(level_change - lc_med)) + 1e-9
-    step_frames = np.where(level_change > lc_med + 8.0 * 1.4826 * lc_mad)[0]
-    for s in step_frames:
-        lo, hi = max(0, s - w), min(n_samples, s + w + 1)
-        is_clean[lo:hi] = False
+    spectrum = np.abs(np.fft.rfft(signal * window, n=nfft)) ** 2
+    frequencies = np.fft.rfftfreq(nfft, d=1.0 / fps)
 
-    best_len = 0
-    best_window = None
-    start = None
-    for i, c in enumerate(is_clean):
-        if c and start is None:
-            start = i
-        elif not c and start is not None:
-            if i - start > best_len:
-                best_len = i - start
-                best_window = (start, i)
-            start = None
-    if start is not None and n_samples - start > best_len:
-        best_len = n_samples - start
-        best_window = (start, n_samples)
+    # Restrict the spectrum to the physiological HR range.
+    band = (frequencies >= config.HR_FREQ_MIN_HZ) & (frequencies <= config.HR_FREQ_MAX_HZ)
+    if not band.any():
+        return None, 0.0
 
-    if best_window is None or best_len < int(min_sec * fps):
-        return None
+    band_frequencies = frequencies[band]
+    band_power = spectrum[band]
 
-    if target_sec is not None:
-        target_len = int(round(target_sec * fps))
-        a, b = best_window
-        if (b - a) > target_len:
-            best_start, best_score = a, np.inf
-            for s in range(a, b - target_len + 1):
-                score = float(np.mean(local_motion[s: s + target_len]))
-                if score < best_score:
-                    best_score, best_start = score, s
-            best_window = (best_start, best_start + target_len)
+    # Select the frequency with the highest spectral power.
+    peak_index = int(np.argmax(band_power))
+    peak_power = band_power[peak_index]
 
-    return best_window
+    # Measure peak prominence relative to the median band power.
+    confidence = float(peak_power / (np.median(band_power) + 1e-12))
+
+    heart_rate = float(band_frequencies[peak_index] * 60.0)
+    return heart_rate, confidence
