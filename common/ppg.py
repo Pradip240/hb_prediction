@@ -22,17 +22,22 @@ def load_pw(path: str, fallback_fs: float = 100.0) -> PPGSignal:
     """
     values: list[float] = []
     timestamps: list[datetime] = []
+    bad_rows: list[tuple[int, str, str]] = []
 
     # Read the PPG value and timestamp from each PW record.
     with open(path, encoding="latin-1") as file:
-        for line in file:
+        for line_number, line in enumerate(file, start=1):
             line = line.strip()
             if not line:
                 continue
             fields = line.split()
-            values.append(float(fields[0]))
-            timestamps.append(datetime.fromisoformat(f"{fields[1]} {fields[2]}"))
-
+            try:
+                values.append(float(fields[0]))
+                timestamps.append(datetime.fromisoformat(f"{fields[1]} {fields[2]}"))
+            except (ValueError, IndexError) as e:
+                bad_rows.append((line_number, line, str(e)))
+    if len(bad_rows) > 0:
+        print(f"Skipped {len(bad_rows)} problematic rows from {path}")
     # Convert the collected samples to the representation used by the pipeline.
     samples = np.asarray(values, dtype=np.float64)
     sampling_frequency = fallback_fs
