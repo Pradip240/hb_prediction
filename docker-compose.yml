@@ -42,54 +42,55 @@ services:
   #             "--signals-dir", "/output/signals", "--plots-dir", "/output/plots",
   #             "--no-plot", "--no-video", "--overwrite", "--workers", "4"]
 
-  prepare_dataset:
+  # prepare_dataset:
+  #   image: rppg-base
+  #   container_name: prepare-dataset
+  #   volumes:
+  #     - ./data:/data:ro
+  #     - ./output:/output
+  #     - ./common:/app/common:ro
+  #     - ./prepare_dataset:/app/prepare_dataset:ro
+  #   command: ["python", "-m", "prepare_dataset.prepare_dataset", "--signals-dir", "/output/signals",
+  #             "--ppg-dir", "/data/ppg", "--ground-truth", "/data/ground_truth.csv",
+  #             "--out-dir", "/output/dataset", "--workers", "4"]
+
+  hr_training:
     image: rppg-base
-    container_name: prepare-dataset
+    container_name: hr-training
     volumes:
       - ./data:/data:ro
       - ./output:/output
       - ./common:/app/common:ro
-      - ./prepare_dataset:/app/prepare_dataset:ro
-    command: ["python", "-m", "prepare_dataset.prepare_dataset", "--signals-dir", "/output/signals",
-              "--ppg-dir", "/data/ppg", "--ground-truth", "/data/ground_truth.csv",
-              "--out-dir", "/output/dataset", "--workers", "4"]
+      - ./hr_model:/app/hr_model:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: ["python", "-m", "hr_model.train", "--out-dir", "/output/hr_model",
+              "--segments-dir", "/output/dataset", "--manifest", "/output/dataset/segments_manifest.csv",
+              "--epochs", "120", "--batch-size", "256"]
 
-  # hr_training:
-  #   image: rppg-base
-  #   container_name: hr-training
-  #   volumes:
-  #     - ./data:/data:ro
-  #     - ./output:/output
-  #     - ./common:/app/common:ro
-  #     - ./hr_training:/app/hr_training:ro
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - driver: nvidia
-  #             count: all
-  #             capabilities: [gpu]
-  #   command: ["python", "hr_training/train.py", "--segments-dir", "/output/train_data", "--ppg-dir", "/data/ppg",
-  #             "--out-dir", "/output/hr_model", "--epochs", "120", "--batch-size", "128"]
-
-  # hb_training:
-  #   image: rppg-base
-  #   container_name: hb-training
-  #   volumes:
-  #     - ./data:/data:ro
-  #     - ./output:/output
-  #     - ./common:/app/common:ro
-  #     - ./hb_training:/app/hb_training:ro
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - driver: nvidia
-  #             count: all
-  #             capabilities: [gpu]
-  #   command: ["python", "hb_training/train.py", "--segments-dir", "/output/train_data", 
-  #             "--ground-truth", "/data/ground_truth.csv", "--out-dir", "/output/hb_model",
-  #             "--epochs", "120", "--batch-size", "128"]
+  hb_training:
+    image: rppg-base
+    container_name: hb-training
+    volumes:
+      - ./data:/data:ro
+      - ./output:/output
+      - ./common:/app/common:ro
+      - ./hb_model:/app/hb_model:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: ["python", "-m", "hb_model.train", "--out-dir", "/output/hb_model",
+              "--segments-dir", "/output/dataset", "--manifest", "/output/dataset/segments_manifest.csv",
+              "--epochs", "120", "--batch-size", "256"]
 
   # rppg_prediction:
   #   image: rppg-base

@@ -1,34 +1,37 @@
-"""Train HRSpectralNet on facial RGB signals and pixel-count features.
+"""Train HbMLP on engineered facial RGB and pixel-count features.
 
-The model input is constructed from the saved per-region signals:
-    signals:      (T, R, 3)
-    pixel_counts: (T, R)
+The Hb model uses low-dimensional, physically motivated features extracted from
+the prepared RGB facial-region signals.
 
-Each region contributes four temporal channels:
-    R, G, B, pixel-count
+Each segment contains:
 
-Therefore, with three facial regions, the model receives 12 channels:
-    (B, 12, T)
+- RGB signals with shape (T, R, 3).
+- Pixel counts with shape (T, R).
+- Sampling frequency.
 
-Pixel-count channels are log-transformed and z-score normalized before being
-passed to the model. RGB channels are z-score normalized per segment.
+The feature extractor converts these measurements into a compact feature
+vector containing colour, amplitude, AC/DC, colour-ratio, and region-quality
+features.
 
 The training procedure:
-1. Load labeled segments and subject-wise train/validation/test splits.
-2. Build the 12-channel model input from RGB signals and pixel counts.
-3. Train HRSpectralNet using its combined Smooth-L1 + soft cross-entropy loss.
-4. Early-stop using validation MAE.
-5. Restore the best validation checkpoint.
-6. Evaluate on held-out subjects.
-7. Save metrics, training history, model weights, and diagnostic plots.
+
+1. Load prepared segments and hemoglobin labels from the manifest.
+2. Extract engineered Hb features through HbDataset.
+3. Split samples by patient so segments from one patient cannot cross splits.
+4. Standardize the feature vector using training-set statistics.
+5. Train HbMLP using Smooth-L1 loss.
+6. Track validation MAE and RMSE.
+7. Restore the best validation checkpoint.
+8. Evaluate on the held-out test set.
+9. Save model weights, metrics, history, configuration, and diagnostic plots.
 
 Usage:
-    python train.py \
-        --segments-dir output/train_data \
-        --ppg-dir data/ppg \
-        --out-dir output/hr_model \
-        --epochs 80 \
-        --batch-size 128
+python train.py \\
+    --segments-dir output/dataset \\
+    --manifest output/dataset/segments_manifest.csv \\
+    --out-dir output/hb_model \\
+    --epochs 100 \\
+    --batch-size 64
 """
 
 import os
@@ -42,28 +45,28 @@ import numpy as np
 from torch.utils.data import DataLoader, Subset
 
 from common.data_types import FileExtension
-from hr_model.model import HRSpectralNet
-from hr_model.dataset import SpectralDataset, load_dataset
-from hr_model.visualize import plot_history
+from hb_model.visualization import plot_history
+from hb_model.dataset import HbDataset, load_dataset
+from hb_model.model import HbMLP
 
 
 def evaluate(
-    model: HRSpectralNet,
+    model: HbMLP,
     loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     device: torch.device
 ) -> tuple[float, float]:
     """
-    Evaluate the model using mean absolute error.
+    Evaluate the Hb model.
 
     Args:
-        model: Trained HRSpectralNet.
+        model: Trained HbMLP.
         loader: Validation or test DataLoader.
         device: Device used for inference.
 
     Returns:
         Tuple containing:
-            - Mean absolute error in BPM.
-            - Percentage of predictions within 6 BPM.
+            - Mean absolute error in g/dL.
+            - Root mean squared error in g/dL.
     """
     model.eval()
 
@@ -71,34 +74,29 @@ def evaluate(
     targets: list[np.ndarray] = []
 
     with torch.no_grad():
-        for signals, heart_rates in loader:
-            signals = signals.to(device)
-            # Run inference without computing gradients.
-            predicted_bpm, _, _ = model(signals)
-            predictions.append(predicted_bpm.cpu().numpy())
-            targets.append(heart_rates.numpy())
+        for features, hemoglobin in loader:
+            features = features.to(device)
+            predicted = model(features)
+            predictions.append(predicted.cpu().numpy())
+            targets.append(hemoglobin.numpy())
 
-    # Return NaN metrics when the loader contains no samples.
     if not predictions:
         return float("nan"), float("nan")
 
     predicted = np.concatenate(predictions)
     target = np.concatenate(targets)
-
-    # Calculate absolute prediction error in BPM.
-    absolute_error = np.abs(predicted - target)
-
-    mae = float(np.mean(absolute_error))
-    within_6 = float(np.mean(absolute_error <= 6.0) * 100.0)
-    return mae, within_6
+    error = predicted - target
+    mae = float(np.mean(np.abs(error)))
+    rmse = float(np.sqrt(np.mean(error**2)))
+    return mae, rmse
 
 
-def load_subjects(dataset: SpectralDataset) -> list[str]:
+def load_subjects(dataset: HbDataset) -> list[str]:
     """
     Load the patient ID for every dataset sample from the manifest.
 
     Args:
-        dataset: Loaded SpectralDataset.
+        dataset: Loaded HbDataset.
 
     Returns:
         Patient ID for each dataset sample.
@@ -106,10 +104,11 @@ def load_subjects(dataset: SpectralDataset) -> list[str]:
     # Map each segment name to its patient ID from the manifest.
     subjects_by_segment: dict[str, str] = {}
 
-    with open(dataset.manifest, encoding="utf-8-sig", newline="") as file:
+    with open(
+        dataset.manifest, encoding="utf-8-sig", newline="") as file:
         reader = csv.DictReader(file)
         for row in reader:
-            segment = row["segment"]
+            segment = row["segment"].strip()
             patient_id = row["patient_id"].strip()
             if patient_id:
                 subjects_by_segment[segment] = patient_id
@@ -130,10 +129,12 @@ def split_subjects(
     seed: int,
     train_ratio: float = 0.8,
     val_ratio: float = 0.1,
-    test_ratio: float = 0.1,
+    test_ratio: float = 0.1
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Randomly split subjects into train, validation, and test sets.
+
+    All samples belonging to one patient remain in the same split.
 
     Args:
         subjects: Patient ID for every dataset sample.
@@ -157,7 +158,6 @@ def split_subjects(
     rng.shuffle(unique_subjects)
 
     n_subjects = len(unique_subjects)
-
     # Calculate the number of subjects assigned to validation and test sets.
     n_test = max(1, int(round(n_subjects * test_ratio)))
     n_val = max(1, int(round(n_subjects * val_ratio)))
@@ -173,7 +173,6 @@ def split_subjects(
     train_subjects = set(unique_subjects[n_test + n_val:])
 
     subject_array = np.asarray(subjects)
-
     # Convert subject assignments into dataset sample indices.
     train_indices = np.where(np.isin(subject_array, list(train_subjects)))[0]
     val_indices = np.where(np.isin(subject_array, list(val_subjects)))[0]
@@ -181,8 +180,25 @@ def split_subjects(
     return train_indices, val_indices, test_indices
 
 
+def standardize_features(train_features: np.ndarray, features: np.ndarray) -> np.ndarray:
+    """
+    Standardize features using statistics calculated from training data.
+
+    Args:
+        train_features: Training feature matrix.
+        features: Feature matrix to transform.
+
+    Returns:
+        Standardized feature matrix.
+    """
+    mean = np.mean(train_features, axis=0)
+    std = np.std(train_features, axis=0)
+    std = np.where(std < 1e-8, 1.0, std)
+    return (features - mean) / std
+
+
 def train(
-    model: HRSpectralNet,
+    model: HbMLP,
     train_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     val_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     device: torch.device,
@@ -191,35 +207,37 @@ def train(
     learning_rate: float,
     weight_decay: float,
     patience: int,
-) -> tuple[HRSpectralNet, list[dict[str, float]]]:
+) -> tuple[HbMLP, list[dict[str, float]]]:
     """
-    Train HRSpectralNet and restore the best validation checkpoint.
+    Train HbMLP and restore the best validation checkpoint.
 
     Args:
-        model: HRSpectralNet to train.
-        train_loader: DataLoader containing training samples.
-        val_loader: DataLoader containing validation samples.
+        model: HbMLP to train.
+        train_loader: Training DataLoader.
+        val_loader: Validation DataLoader.
         device: Device used for training.
-        output_dir: Directory for checkpoints and training history.
-        epochs: Maximum number of training epochs.
+        output_dir: Directory for checkpoints and history.
+        epochs: Maximum number of epochs.
         learning_rate: Initial learning rate.
         weight_decay: Adam weight decay.
-        patience: Number of epochs without validation improvement before stopping.
+        patience: Epochs without validation improvement before stopping.
 
     Returns:
         Tuple containing:
             - Model restored to its best validation checkpoint.
-            - Training history for every completed epoch.
+            - Training history.
     """
     os.makedirs(output_dir, exist_ok=True)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
+    criterion = torch.nn.SmoothL1Loss()
 
     best_val_mae = float("inf")
     best_state: dict[str, torch.Tensor] | None = None
     bad_epochs = 0
-
     history: list[dict[str, float]] = []
+
     best_weights_path = os.path.join(output_dir, "best_model.pt")
     last_weights_path = os.path.join(output_dir, "last_model.pt")
     history_path = os.path.join(output_dir, "history.csv")
@@ -231,49 +249,43 @@ def train(
         sample_count = 0
         # Show batch-level training progress for the current epoch.
         progress = tqdm.tqdm(train_loader, desc=f"Epoch {epoch:3d}/{epochs}", unit="batch", leave=False)
-        for signals, heart_rates in progress:
-            signals = signals.to(device)
-            heart_rates = heart_rates.to(device)
-            # Forward pass and combined spectral/regression loss.
-            predicted_bpm, logits, _ = model(signals)
-            loss, _ = model.loss(predicted_bpm, logits, heart_rates)
+        for features, hemoglobin in progress:
+            features = features.to(device)
+            hemoglobin = hemoglobin.to(device)
+            predicted = model(features)
+            loss = criterion(predicted, hemoglobin)
             optimizer.zero_grad()
-            loss.backward() # type: ignore
+            loss.backward()
             optimizer.step() # type: ignore
-            batch_size = signals.shape[0]
+            batch_size = features.shape[0]
             total_loss += loss.item() * batch_size
             sample_count += batch_size
             # Update the progress bar with the current batch loss.
             progress.set_postfix(loss=f"{loss.item():.4f}") # type: ignore
-        train_loss = total_loss / max(1, sample_count)
 
-        # Validation BPM accuracy is used for model selection.
-        val_mae, val_within_6 = evaluate(model, val_loader, device)
+        train_loss = total_loss / max(1, sample_count)
+        val_mae, val_rmse = evaluate(model, val_loader, device)
         scheduler.step(val_mae) # type: ignore
         current_lr = float(optimizer.param_groups[0]["lr"])
 
-        # Always save the most recent model state.
-        torch.save(model.state_dict(), last_weights_path)
-
-        history.append(
-            {
-                "epoch": float(epoch),
-                "train_loss": train_loss,
-                "val_mae": val_mae,
-                "val_within_6": val_within_6,
-                "lr": current_lr,
-            }
-        )
         # Save the history after every epoch so progress is not lost.
+        history.append({
+            "epoch": float(epoch),
+            "train_loss": train_loss,
+            "val_mae": val_mae,
+            "val_rmse": val_rmse,
+            "lr": current_lr
+        })
+
         with open(history_path, "w", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(
-                file, fieldnames=["epoch", "train_loss", "val_mae", "val_within_6", "lr"]
-            )
+            writer = csv.DictWriter(file, fieldnames=["epoch", "train_loss", "val_mae", "val_rmse", "lr"])
             writer.writeheader()
             writer.writerows(history)
 
+        torch.save(model.state_dict(), last_weights_path)
+
         # Save a separate checkpoint whenever validation MAE improves.
-        if np.isfinite(val_mae) and val_mae < best_val_mae:
+        if (np.isfinite(val_mae) and val_mae < best_val_mae):
             best_val_mae = val_mae
             bad_epochs = 0
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
@@ -286,8 +298,8 @@ def train(
         print(
             f"epoch {epoch:3d}/{epochs} "
             f"loss={train_loss:.4f} "
-            f"val_mae={val_mae:.2f} BPM "
-            f"val_w6={val_within_6:.1f}% "
+            f"val_mae={val_mae:.3f} g/dL "
+            f"val_rmse={val_rmse:.3f} g/dL "
             f"lr={current_lr:.2e}"
             f"{tag}"
         )
@@ -310,19 +322,19 @@ def train(
 
 def main() -> None:
     """
-    Train and evaluate HRSpectralNet.
+    Train and evaluate HbMLP.
     """
     parser = argparse.ArgumentParser(
-        description="Train spectral HR model on facial RGB + pixel-count segments."
+        description=("Train hemoglobin regression model on facial RGB and pixel-count features.")
     )
     parser.add_argument("--segments-dir", default="output/dataset")
     parser.add_argument("--manifest", default="output/dataset/segments_manifest.csv")
-    parser.add_argument("--out-dir", default="output/hr_model")
+    parser.add_argument("--out-dir", default="output/hb_model")
     parser.add_argument("--train_ratio", type=float, default=0.80)
     parser.add_argument("--val_ratio", type=float, default=0.10)
     parser.add_argument("--test_ratio", type=float, default=0.10)
-    parser.add_argument("--epochs", type=int, default=80)
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--patience", type=int, default=15)
@@ -333,10 +345,10 @@ def main() -> None:
     # Reproducibility.
     torch.manual_seed(args.seed) # type: ignore
     np.random.seed(args.seed)
-    device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device_name = (args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     device = torch.device(device_name)
-    os.makedirs(args.out_dir, exist_ok=True)
     print(f"device: {device}")
+    os.makedirs(args.out_dir, exist_ok=True)
 
     # Load dataset.
     print("Loading dataset...")
@@ -346,8 +358,6 @@ def main() -> None:
     subjects = load_subjects(dataset)
     print(f"  samples:  {len(dataset)}")
     print(f"  subjects: {len(set(subjects))}")
-
-    # Subject-wise split
     train_indices, val_indices, test_indices = split_subjects(
         subjects, args.seed, args.train_ratio, args.val_ratio, args.test_ratio
     )
@@ -362,7 +372,12 @@ def main() -> None:
     if len(test_indices) == 0:
         raise RuntimeError("Test split is empty.")
 
-    # Data loaders
+    # Inspect feature dimensionality.
+    sample_features, _ = dataset[int(train_indices[0])]
+    n_features = sample_features.shape[0]
+    print(f"  feature count: {n_features}")
+
+    # Data loaders.
     train_loader = DataLoader(
         Subset(dataset, train_indices.tolist()),
         batch_size=args.batch_size,
@@ -383,11 +398,7 @@ def main() -> None:
     )
 
     # Create Model
-    sample_signal, _ = dataset[train_indices[0]]
-    n_channels = sample_signal.shape[0]
-    print(f"  input shape:    {tuple(sample_signal.shape)}")
-    print(f"  input channels: {n_channels}")
-    model = HRSpectralNet(n_channels=n_channels).to(device)
+    model = HbMLP(n_in=n_features).to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     print(f"model parameters: {parameter_count / 1e3:.1f}k")
 
@@ -401,72 +412,60 @@ def main() -> None:
         epochs=args.epochs,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
-        patience=args.patience,
+        patience=args.patience
     )
 
-    # Evaluate the restored best model on held-out test subjects
-    test_mae, test_within_6 = evaluate(model, test_loader, device)
+    # Final test evaluation
+    test_mae, test_rmse = evaluate(model, test_loader, device)
     print()
     print("=== Test results ===")
-    print(f"MAE:      {test_mae:.2f} BPM")
-    print(f"Within 6: {test_within_6:.1f}%")
+    print(f"MAE:  {test_mae:.3f} g/dL")
+    print(f"RMSE: {test_rmse:.3f} g/dL")
 
-    # Save final metrics
+    # Save final metrics.
     metrics_path = os.path.join(args.out_dir, "metrics.json")
-    best_val_mae = min(entry["val_mae"] for entry in history if np.isfinite(entry["val_mae"]))
     with open(metrics_path, "w", encoding="utf-8") as file:
         json.dump(
             {
-                "best_val_mae": best_val_mae,
+                "best_val_mae": min(entry["val_mae"] for entry in history if np.isfinite(entry["val_mae"])),
                 "test_mae": test_mae,
-                "test_within_6": test_within_6,
+                "test_rmse": test_rmse,
                 "train_samples": len(train_indices),
                 "val_samples": len(val_indices),
                 "test_samples": len(test_indices),
                 "train_subjects": len(set(subject_array[train_indices])),
                 "val_subjects": len(set(subject_array[val_indices])),
                 "test_subjects": len(set(subject_array[test_indices])),
-                "train_ratio": args.train_ratio,
-                "val_ratio": args.val_ratio,
-                "test_ratio": args.test_ratio,
-                "n_channels": n_channels,
-                "nfft": model.nfft,
-                "hr_min": float(model.band_bpm[0].item()), # type: ignore
-                "hr_max": float(model.band_bpm[-1].item()), # type: ignore
+                "n_features": n_features,
                 "seed": args.seed,
             },
             file,
             indent=2
         )
 
-    # Save model configuration
+    # Save model configuration.
     config_path = os.path.join(args.out_dir, "model_config.json")
     with open(config_path, "w", encoding="utf-8") as file:
         json.dump(
             {
-                "n_channels": n_channels,
-                "fps": model.fps,
-                "nfft": model.nfft,
-                "hr_min": float(model.band_bpm[0].item()), # type: ignore
-                "hr_max": float(model.band_bpm[-1].item()), # type: ignore
-                "input_layout": "(B, R*4, T)",
+                "n_features": n_features,
+                "hidden_width": 64,
+                "dropout": 0.3,
+                "feature_names": dataset.feature_names,
             },
             file,
             indent=2
         )
 
-    # Generate training and test plots
-    plot_history(history=history, test_mae=test_mae, test_within_6=test_within_6, output_dir=args.out_dir)
+    # Save final diagnostic plots.
+    plot_history(history=history, test_mae=test_mae, test_rmse=test_rmse, output_dir=args.out_dir)
 
     # Print output files
-    best_weights_path = os.path.join(args.out_dir, "best_model.pt")
-    last_weights_path = os.path.join(args.out_dir, "last_model.pt")
-    history_path = os.path.join(args.out_dir, "history.csv")
     print()
     print("=== Output files ===")
-    print(f"best weights: {best_weights_path}")
-    print(f"last weights: {last_weights_path}")
-    print(f"history:      {history_path}")
+    print(f"best weights: {os.path.join(args.out_dir, 'best_model.pt')}")
+    print(f"last weights: {os.path.join(args.out_dir, 'last_model.pt')}")
+    print(f"history:      {os.path.join(args.out_dir, 'history.csv')}")
     print(f"metrics:      {metrics_path}")
     print(f"config:       {config_path}")
 
