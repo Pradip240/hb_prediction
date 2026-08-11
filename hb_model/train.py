@@ -449,7 +449,7 @@ def main() -> None:
         json.dump(
             {
                 "n_features": n_features,
-                "hidden_width": 64,
+                "hidden_width": 512,
                 "dropout": 0.3,
                 "feature_names": dataset.feature_names,
             },

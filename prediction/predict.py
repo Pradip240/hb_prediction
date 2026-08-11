@@ -1,235 +1,97 @@
-"""predict.py — HR (DSP baseline + trained model) and Hb prediction over clean segments.
+"""Run HR and hemoglobin prediction over prepared dataset segments.
 
-Runs over a train_data/ folder of <clip>_<k>_signals.npz segments (uniform
-(R, 600, 3) rPPG signals at a fixed fps, from prepare_dataset) and, per segment:
+Inputs
+------
+Dataset directory
+    --dataset-dir
+        Directory containing prepared dataset segment archives.
 
-  * estimates HR three ways — POS, CHROM, and the raw green channel — each with the
-    spectral peak's prominence as a confidence (the unsupervised DSP baseline);
-  * derives a per-segment ground-truth HR from the contact PPG (.PW) over that segment's
-    exact time span (from the prepare_dataset manifest), so estimates are scored per
-    segment even when HR drifts across a recording (post-exercise);
-  * optionally runs the trained HR model (--hr-model) to fill the hr_model column + spectrum
-    panel, and the trained Hb model (--hb-model) to fill the hb_pred column + plot title.
-    Hb is per-subject, so its value repeats across a subject's segments.
+Manifest
+    --manifest
+        CSV manifest describing each dataset segment, including segment
+        timing, ground-truth HR, hemoglobin, and optional PPG metadata.
 
-Outputs:
-  <out-dir>/hr_results.csv                per segment: HR per method + confidence, PPG
-                                          label, hr_model, hb_pred.
-  <out-dir>/plots/<segment>.png           stacked subplots: raw region RGB, POS, CHROM,
-                                          green, PPG waveform, and the model spectrum
-                                          (title shows HR label / model HR / Hb).
-  <out-dir>/hr_accuracy.png               predicted-vs-true scatter per method (+ model).
-  <out-dir>/hr_accuracy_by_condition.png  MAE by exercise-state x camera; + hr_by_condition.csv
+PPG directory
+    --ppg-dir
+        Directory containing contact PPG (.PW) files referenced by the
+        segment manifest.
 
-Usage:
-  python predict.py --segments-dir output/train_data --ppg-dir data/ppg \
-      --out-dir output/prediction [--hr-model output/hr_model/hr_model.pt] \
-      [--hb-model output/hb_model/hb_model.pt] [--no-plot]
+Optional trained models
+    --hr-model
+        Path to a trained HR model. When provided, each segment receives
+        a trained HR prediction and confidence.
+
+    --hb-model
+        Path to a trained hemoglobin model. When provided, each segment
+        receives a trained Hb prediction.
+
+Processing
+----------
+For each dataset segment:
+
+    - Load the uniformly sampled RGB signals and pixel-count information.
+    - Extract HR using POS, CHROM, and the raw green-channel methods.
+    - Load the corresponding contact PPG when available.
+    - Use the manifest PPG HR as the segment-level HR ground truth.
+    - Optionally run the trained HR model.
+    - Optionally run the trained Hb model.
+    - Save a per-segment prediction plot when plotting is enabled.
+
+Segments are processed in parallel using ProcessPoolExecutor.
+
+Outputs
+-------
+<out-dir>/hr_results.csv
+    Per-segment prediction results containing:
+        - segment metadata
+        - POS HR and confidence
+        - CHROM HR and confidence
+        - green-channel HR and confidence
+        - HR ground truth
+        - trained HR prediction and confidence
+        - hemoglobin ground truth
+        - trained Hb prediction and confidence
+
+<out-dir>/plots/<segment>.png
+    Visualization of the individual segment's HR and Hb predictions.
+
+<out-dir>/hr_accuracy.png
+    Aggregate predicted-versus-ground-truth HR accuracy plot for the
+    available prediction methods and trained HR model.
+
+<out-dir>/hb_accuracy.png
+    Aggregate predicted-versus-ground-truth hemoglobin accuracy plot,
+    including per-segment and per-subject evaluation.
+
+Usage
+-----
+python predict.py \
+    --dataset-dir output/dataset \
+    --manifest output/dataset/segments_manifest.csv \
+    --ppg-dir data/ppg \
+    --out-dir output/prediction \
+    [--hr-model output/hr_model/hr_model.pt] \
+    [--hb-model output/hb_model/hb_model.pt] \
+    [--no-plot]
 """
 
-import argparse
-import csv
-import glob
 import os
-import re
+import csv
+import argparse
+from dataclasses import asdict, fields
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from datetime import datetime
 
+import torch
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
-from common import config
-from common import signal_processing as sp
+from common.data_types import (
+    FileExtension, WindowInfo, PredictionTask, PredictionRecord, PredictionResult, PPGSignal
+)
+from common.ppg import load_pw, ppg_segment
+from prediction.models import predict_hr, predict_hb
+from prediction.rppg_algorithms import method_waveforms
+from prediction.visualization import plot_segment, write_accuracy_plot, write_hb_accuracy_plot
 
-try:
-    import torch
-    _HAS_TORCH = True
-except ImportError:
-    _HAS_TORCH = False
-
-CAMERAS = ("IriunWebcam", "FullHDwebcam", "USBVideo")
-HR_LO_HZ = getattr(config, "HR_FREQ_MIN_HZ", 0.7)
-HR_HI_HZ = getattr(config, "HR_FREQ_MAX_HZ", 3.0)
-PPG_HR_LO, PPG_HR_HI = 0.6, 3.5
-_PW_LINE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s+(\d{4}-\d{2}-\d{2}[ T][\d:.]+)")
-
-
-# ----------------------------------------------------------------------
-# HR from a 1-D pulse waveform (spectral peak + prominence as confidence)
-# ----------------------------------------------------------------------
-
-def spectral_hr(sig, fps, lo=HR_LO_HZ, hi=HR_HI_HZ):
-    """Return (bpm, confidence). Confidence = peak power / median band power."""
-    x = np.asarray(sig, dtype=np.float64)
-    x = x[np.isfinite(x)]
-    if len(x) < 16 or np.std(x) < 1e-9:
-        return None, 0.0
-    x = x - x.mean()
-    w = np.hanning(len(x))
-    nfft = int(2 ** np.ceil(np.log2(len(x) * 4)))
-    psd = np.abs(np.fft.rfft(x * w, n=nfft)) ** 2
-    freqs = np.fft.rfftfreq(nfft, d=1.0 / fps)
-    band = (freqs >= lo) & (freqs <= hi)
-    if not band.any():
-        return None, 0.0
-    fb, pb = freqs[band], psd[band]
-    i = int(np.argmax(pb))
-    conf = float(pb[i] / (np.median(pb) + 1e-12))
-    return float(fb[i] * 60.0), conf
-
-
-def method_waveforms(signals, fps, pixel_counts=None):
-    """Return dict method -> (waveform, bpm, confidence) for POS, CHROM, green.
-
-    POS/CHROM are computed on the combined region RGB; green is the combined green
-    channel. Regions are combined size-aware (weighted by skin-pixel count) when counts
-    are available, else equal-weight — see sp.combine_regions. Each waveform is bandpassed
-    for display + HR.
-    """
-    face = sp.combine_regions(signals, pixel_counts, fps)   # (T, 3) combined RGB
-    out = {}
-    pos = sp.extract_pos(face, fps=fps)
-    out["POS"] = (pos, *spectral_hr(pos, fps))
-    chrom = sp.extract_chrom(face, fps=fps)
-    out["CHROM"] = (chrom, *spectral_hr(chrom, fps))
-    green = sp.bandpass_filter(sp.interpolate_nans(face[:, 1]), fps) \
-        if hasattr(sp, "bandpass_filter") else sp.interpolate_nans(face[:, 1])
-    out["green"] = (green, *spectral_hr(face[:, 1], fps))
-    return out
-
-
-# ----------------------------------------------------------------------
-# PPG label for a segment's time span
-# ----------------------------------------------------------------------
-
-def load_pw(path, fallback_fs=100.0):
-    """Return (values, fs, t0_abs) — samples, sample rate, absolute start time (s)."""
-    vals, times = [], []
-    with open(path, encoding="latin-1") as fh:
-        for line in fh:
-            line = line.strip().replace("\r", "")
-            if not line:
-                continue
-            m = _PW_LINE.match(line)
-            if m:
-                vals.append(float(m.group(1)))
-                try:
-                    times.append(datetime.fromisoformat(m.group(2).replace("T", " ")))
-                except ValueError:
-                    times.append(None)
-            elif line.split():
-                try:
-                    vals.append(float(line.split()[0]))
-                    times.append(None)
-                except ValueError:
-                    pass
-    arr = np.asarray(vals, dtype=np.float64)
-    fs, t0 = fallback_fs, 0.0
-    if len(times) > 1 and all(t is not None for t in times):
-        span = (times[-1] - times[0]).total_seconds()
-        if span > 0:
-            fs = (len(times) - 1) / span
-        t0 = times[0].timestamp()
-    return arr, fs, t0
-
-
-def ppg_segment(ppg, fs, t_start, t_end):
-    """Slice the PPG to [t_start, t_end] seconds (relative to PPG start) and return it."""
-    a = int(round(t_start * fs))
-    b = int(round(t_end * fs))
-    a, b = max(0, a), min(len(ppg), b)
-    return ppg[a:b] if b > a else np.array([])
-
-
-def parse_clip_state(clip):
-    subj = re.search(r"(\d+)", clip)
-    state = "after" if "after" in clip else ("before" if "before" in clip else None)
-    return (subj.group(1) if subj else None), state
-
-
-# ----------------------------------------------------------------------
-# Plot
-# ----------------------------------------------------------------------
-
-def plot_segment(seg_name, signals, fps, waves, ppg_wave, ppg_fs, label_hr, out_png, model_pred=None, hb_pred=None, hb_true=None, hr_from_csv=False):
-    T = signals.shape[1]
-    t = np.arange(T) / fps
-    fig, axs = plt.subplots(6, 1, figsize=(12, 13), sharex=False)
-
-    # 1. raw region RGB (green channel per region, the most pulse-bearing)
-    colors = {"forehead": "olive", "lcheek": "magenta", "rcheek": "green"}
-    names = list(config.REGION_ORDER) if hasattr(config, "REGION_ORDER") else [f"r{i}" for i in range(signals.shape[0])]
-    for r in range(signals.shape[0]):
-        axs[0].plot(t, signals[r, :, 1], color=colors.get(names[r], None), lw=0.8, label=names[r])
-    axs[0].set_ylabel("raw green\n(per region)"); axs[0].legend(fontsize=7, loc="upper right"); axs[0].grid(alpha=0.3)
-
-    # 2-4. POS / CHROM / green pulse waveforms
-    for ax, key in zip(axs[1:4], ["POS", "CHROM", "green"]):
-        wf, bpm, conf = waves[key]
-        wf = np.asarray(wf, dtype=np.float64)
-        wf = (wf - np.nanmean(wf)) / (np.nanstd(wf) + 1e-9)
-        ax.plot(t[:len(wf)], wf, lw=0.9)
-        hr_txt = f"{bpm:.1f} BPM (conf {conf:.0f})" if bpm is not None else "no peak"
-        ax.set_ylabel(f"{key}\n{hr_txt}"); ax.grid(alpha=0.3)
-
-    # 5. HR ground truth. MCD: the PPG waveform over this span. Custom: no PPG, so show the
-    # 'pulse' label as a number (constant per subject).
-    if hr_from_csv:
-        txt = f"HR ground truth (from CSV): {label_hr:.0f} BPM" if label_hr is not None else "HR ground truth: n/a"
-        axs[4].text(0.5, 0.5, txt, ha="center", va="center", transform=axs[4].transAxes,
-                    fontsize=12, fontweight="bold", color="crimson")
-        axs[4].set_ylabel("HR label\n(pulse)")
-        axs[4].set_xticks([]); axs[4].set_yticks([])
-    elif len(ppg_wave) > 4:
-        tp = np.arange(len(ppg_wave)) / ppg_fs
-        pw = (ppg_wave - np.mean(ppg_wave)) / (np.std(ppg_wave) + 1e-9)
-        axs[4].plot(tp, pw, color="crimson", lw=0.8)
-        axs[4].set_ylabel(f"PPG (label)\n{label_hr:.1f} BPM" if label_hr is not None else "PPG (label)")
-        axs[4].grid(alpha=0.3)
-    else:
-        axs[4].text(0.5, 0.5, "no PPG for this span", ha="center", va="center", transform=axs[4].transAxes)
-        axs[4].set_ylabel("PPG (label)")
-        axs[4].grid(alpha=0.3)
-
-    # 6. trained model: its predicted spectrum (pulse-likelihood over BPM), peak = its HR.
-    # (The model has no time-domain waveform — it outputs a frequency distribution.)
-    if model_pred is not None:
-        bpm_grid, prob, model_hr = model_pred
-        axs[5].plot(bpm_grid, prob, color="purple", lw=1.2)
-        axs[5].axvline(model_hr, color="purple", ls="--", lw=1)
-        if label_hr is not None:
-            axs[5].axvline(label_hr, color="crimson", ls=":", lw=1, label="PPG label")
-            axs[5].legend(fontsize=7, loc="upper right")
-        axs[5].set_ylabel(f"model spectrum\n{model_hr:.1f} BPM")
-        axs[5].set_xlabel("HR (BPM)")
-    else:
-        axs[5].text(0.5, 0.5, "Trained model (pending)", ha="center", va="center",
-                    transform=axs[5].transAxes, color="gray", style="italic")
-        axs[5].set_ylabel("model"); axs[5].set_xlabel("time (s)")
-    axs[5].grid(alpha=0.3)
-
-    title = f"{seg_name}   —   HR: label {label_hr:.1f} BPM" if label_hr is not None else seg_name
-    if model_pred is not None:
-        hr_err = f", err {abs(model_pred[2] - label_hr):.1f}" if label_hr is not None else ""
-        title += f" / model {model_pred[2]:.1f}{hr_err}"
-    if hb_pred is not None or hb_true is not None:
-        if hb_pred is not None and hb_true is not None:
-            title += f"   |   Hb: pred {hb_pred:.2f} vs true {hb_true:.2f} g/dL (err {abs(hb_pred - hb_true):.2f})"
-        elif hb_pred is not None:
-            title += f"   |   Hb: pred {hb_pred:.2f} g/dL (no ground truth)"
-        else:
-            title += f"   |   Hb: true {hb_true:.2f} g/dL (no model)"
-    fig.suptitle(title, fontweight="bold")
-    plt.tight_layout(rect=[0, 0, 1, 0.99])
-    plt.savefig(out_png, dpi=120)
-    plt.close()
-
-
-# ----------------------------------------------------------------------
-# Driver
-# ----------------------------------------------------------------------
 
 def _default_workers():
     try:
@@ -238,614 +100,254 @@ def _default_workers():
         return os.cpu_count() or 1
 
 
-# lazy per-process model cache (avoids re-loading per segment and cross-process pickling)
-_MODEL_CACHE = {}
-
-
-def _load_module(mod_name, filename, search_dirs):
-    """Import a module from one of search_dirs under a UNIQUE name, avoiding the
-    hr_training/model.py vs hb_training/model.py name collision (both are 'model')."""
-    import importlib.util
-    import sys
-    if mod_name in sys.modules:
-        return sys.modules[mod_name]
-    for d in search_dirs:
-        path = os.path.join(d, filename)
-        if os.path.isfile(path):
-            spec = importlib.util.spec_from_file_location(mod_name, path)
-            m = importlib.util.module_from_spec(spec)
-            sys.modules[mod_name] = m
-            spec.loader.exec_module(m)
-            return m
-    raise ImportError(f"{filename} not found in {search_dirs}")
-
-
-def get_model(model_path):
-    if not _HAS_TORCH or not model_path:
-        return None
-    if model_path in _MODEL_CACHE:
-        return _MODEL_CACHE[model_path]
-    try:
-        here = os.path.dirname(__file__)
-        hr_mod = _load_module("hr_model_def", "model.py",
-                              ["hr_training", "/app/hr_training", os.path.join(here, "..", "hr_training")])
-        m = hr_mod.HRSpectralNet(n_channels=9)
-        m.load_state_dict(torch.load(model_path, map_location="cpu"))
-        m.eval()
-        _MODEL_CACHE[model_path] = m
-        return m
-    except Exception as e:
-        _MODEL_CACHE[model_path] = None
-        print(f"  (HR model load failed: {type(e).__name__}: {e})", flush=True)
-        return None
-
-
-def model_predict(model, signals, fps):
-    """Run the spectral model on a segment. Returns (bpm_grid, prob, hr) or None.
-
-    Builds the same 9 z-scored channels the model was trained on, then reads its
-    frequency distribution (the model's own band_bpm grid) and the soft-argmax HR.
+def process_segment(task: PredictionTask) -> PredictionResult:
     """
-    if model is None:
-        return None
-    R, T, C = signals.shape
-    chans = []
-    for r in range(R):
-        for c in range(C):
-            x = signals[r, :, c].astype(np.float64)
-            x = (x - x.mean()) / (x.std() + 1e-9)
-            chans.append(x)
-    X = np.stack(chans, axis=0)[None].astype(np.float32)      # (1, 9, T)
-    with torch.no_grad():
-        pred_bpm, logits, prob = model(torch.from_numpy(X))
-    bpm_grid = model.band_bpm.cpu().numpy()
-    return bpm_grid, prob[0].cpu().numpy(), float(pred_bpm.item())
+    Process a single dataset sample and generate HR and Hb predictions.
 
+    Args:
+        task: Processing task describing the dataset sample and prediction options.
 
-# lazy per-process cache for the Hb model (checkpoint dict, not just weights)
-_HB_CACHE = {}
-
-
-def get_hb_model(hb_model_path):
-    """Load the trained Hb model + its feature-extractor + normalisation. Returns a dict
-    {model, features_mod, mu, sd, y_mean, y_std, region_order} or None. The Hb model
-    consumes engineered amplitude/colour FEATURES (features.py), not the raw signal — so we
-    also need the exact feature code and the train-time normalisation from the checkpoint."""
-    if not _HAS_TORCH or not hb_model_path:
-        return None
-    if hb_model_path in _HB_CACHE:
-        return _HB_CACHE[hb_model_path]
+    Returns:
+        Prediction result for the dataset sample.
+    """
     try:
-        here = os.path.dirname(__file__)
-        dirs = ["hb_training", "/app/hb_training", os.path.join(here, "..", "hb_training")]
-        hb_mod = _load_module("hb_model_def", "model.py", dirs)
-        feat_mod = _load_module("hb_features_def", "features.py", dirs)
-        ck = torch.load(hb_model_path, map_location="cpu", weights_only=False)
-        mu = np.asarray(ck["mu"], dtype=np.float32)
-        sd = np.asarray(ck["sd"], dtype=np.float32)
-        m = hb_mod.HbMLP(len(mu))
-        m.load_state_dict(ck["state_dict"])
-        m.eval()
-        bundle = {"model": m, "features_mod": feat_mod, "mu": mu, "sd": sd,
-                  "y_mean": float(ck["y_mean"]), "y_std": float(ck["y_std"]),
-                  "region_order": list(getattr(config, "REGION_ORDER", ("forehead", "lcheek", "rcheek")))}
-        _HB_CACHE[hb_model_path] = bundle
-        return bundle
-    except Exception as e:
-        _HB_CACHE[hb_model_path] = None
-        print(f"  (Hb model load failed: {type(e).__name__}: {e})", flush=True)
-        return None
+        # Load the uniformly sampled signals and quality information.
+        data = np.load(task.sample_path)
+        signals = data["signals"]
+        fps = float(data["fps"])
+        pixel_counts = data["pixel_counts"]
+        waveforms = method_waveforms(signals, fps, pixel_counts)
+        ppg_wave = np.array([], dtype=np.float64)
+        hr_pred: float | None = None
+        hr_pred_conf: float | None = None
+        hb_pred: float | None = None
+        device = torch.device("cpu")
+        hr_model_prediction = None
 
+        # Generate optional trained-model predictions.
+        if task.hr_model:
+            hr_model_prediction = predict_hr(task.hr_model, task.sample_path, device)
+            hr_pred, hr_pred_conf, _, _ = hr_model_prediction
 
-def hb_predict(bundle, signals, fps):
-    """Predict hemoglobin for one segment. Returns a float (g/dL) or None. Uses the exact
-    feature extractor + normalisation + target de-centring the model was trained with."""
-    if bundle is None:
-        return None
-    try:
-        feats = bundle["features_mod"].extract_features(signals, fps, bundle["region_order"])
-        if not np.all(np.isfinite(feats)):
-            return None
-        x = ((feats - bundle["mu"]) / bundle["sd"]).astype(np.float32)[None]
-        with torch.no_grad():
-            z = bundle["model"](torch.from_numpy(x)).item()
-        return float(z * bundle["y_std"] + bundle["y_mean"])   # de-center to g/dL
-    except Exception as e:
-        print(f"  (Hb predict failed: {type(e).__name__}: {e})", flush=True)
-        return None
+        # Generate optional trained-model predictions.
+        if task.hb_model:
+            hb_pred = predict_hb(task.hb_model, task.sample_path, device)
 
+        # Build the prediction record for this dataset sample.
+        prediction = PredictionRecord(
+            segment=task.name,
+            clip=task.segment.clip,
+            t_start=task.segment.t_start,
+            t_end=task.segment.t_end,
+            hr_pos=waveforms["POS"].heart_rate,
+            conf_pos=waveforms["POS"].confidence,
+            hr_chrom=waveforms["CHROM"].heart_rate,
+            conf_chrom=waveforms["CHROM"].confidence,
+            hr_green=waveforms["green"].heart_rate,
+            conf_green=waveforms["green"].confidence,
+            hr_label=task.hr_true,
+            hr_pred=hr_pred,
+            hr_pred_conf=hr_pred_conf,
+            hb_label=task.hb_true,
+            hb_pred=hb_pred
+        )
 
-def process_segment(task):
-    (seg_name, seg_path, span, ppg_info, out_dir, no_plot, model_path, hb_model_path, hb_true, pulse_hr) = task
-    try:
-        d = np.load(seg_path)
-        signals = d["signals"]
-        fps = float(d["fps"]) if "fps" in getattr(d, "files", []) else config.DEFAULT_FPS
-        pixel_counts = d["pixel_counts"] if "pixel_counts" in getattr(d, "files", []) else None
-        waves = method_waveforms(signals, fps, pixel_counts)
-
-        # HR label: custom dataset supplies a constant 'pulse' per subject (no PPG waveform);
-        # MCD derives it from the PPG over this segment's span.
-        label_hr, ppg_wave, ppg_fs = None, np.array([]), 100.0
-        if pulse_hr is not None:
-            label_hr = float(pulse_hr)                 # from CSV, no waveform to draw
-        elif ppg_info is not None and span is not None:
-            ppg, ppg_fs, _ = ppg_info
-            ppg_wave = ppg_segment(ppg, ppg_fs, span["t_start"], span["t_end"])
-            lbl, _ = spectral_hr(ppg_wave, ppg_fs, PPG_HR_LO, PPG_HR_HI)
-            label_hr = lbl
-
-        # optional trained-model predictions
-        model_pred = model_predict(get_model(model_path), signals, fps) if model_path else None
-        model_hr = model_pred[2] if model_pred is not None else ""
-        hb_pred = hb_predict(get_hb_model(hb_model_path), signals, fps) if hb_model_path else None
-
-        row = {
-            "segment": seg_name,
-            "clip": span["clip"] if span else "",
-            "t_start": span["t_start"] if span else "",
-            "t_end": span["t_end"] if span else "",
-            "hr_pos": round(waves["POS"][1], 1) if waves["POS"][1] is not None else "",
-            "conf_pos": round(waves["POS"][2], 1),
-            "hr_chrom": round(waves["CHROM"][1], 1) if waves["CHROM"][1] is not None else "",
-            "conf_chrom": round(waves["CHROM"][2], 1),
-            "hr_green": round(waves["green"][1], 1) if waves["green"][1] is not None else "",
-            "conf_green": round(waves["green"][2], 1),
-            "hr_label": round(label_hr, 1) if label_hr is not None else "",
-            "hr_model": round(model_hr, 1) if model_hr != "" else "",
-            "hb_pred": round(hb_pred, 2) if hb_pred is not None else "",
-            "hb_true": round(hb_true, 2) if hb_true is not None else "",
-        }
-
-        if not no_plot:
-            plots_dir = os.path.join(out_dir, "plots")
+        # Plot the prediction results
+        if not task.no_plot:
+            # Load ppg wave if available
+            if task.ppg_info:
+                ppg_wave = ppg_segment(task.ppg_info, task.segment.t_start, task.segment.t_end)
+            plots_dir = os.path.join(task.output_dir, "plots")
             os.makedirs(plots_dir, exist_ok=True)
-            plot_segment(seg_name, signals, fps, waves, ppg_wave, ppg_fs, label_hr,
-                         os.path.join(plots_dir, f"{seg_name}.png"), model_pred=model_pred,
-                         hb_pred=hb_pred, hb_true=hb_true, hr_from_csv=(pulse_hr is not None))
-        return seg_name, row, None
+            plot_segment(
+                task=task,
+                signals=signals,
+                fps=fps,
+                waveforms=waveforms,
+                ppg_wave=ppg_wave,
+                output_path=os.path.join(plots_dir, f"{task.name}.png"),
+                hr_model_prediction=hr_model_prediction,
+                hb_pred=hb_pred
+            )
+        return PredictionResult(name=task.name, prediction=prediction, success=True, error=None)
     except Exception as exc:
-        return seg_name, None, f"{type(exc).__name__}: {exc}"
+        return PredictionResult(name=task.name, prediction=None, success=False, error=f"{type(exc).__name__}: {exc}")
 
 
-def write_accuracy_plot(rows, out_dir):
-    """Scatter of predicted vs PPG-label HR for POS/CHROM/green (and the model if present),
-    y=x line, DSP points split by confidence. Annotates MAE/bias/within-6. A 4th panel is
-    added when the hr_model column has values. Skipped if too few labeled segments."""
-    def fnum(v):
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return np.nan
-
-    lab = np.array([fnum(r.get("hr_label")) for r in rows])
-    if np.isfinite(lab).sum() < 5:
-        print("  (accuracy plot skipped: fewer than 5 labeled segments)")
-        return None
-
-    # DSP methods (with confidence), plus the model if the column is populated
-    panels = [("POS", "hr_pos", "conf_pos"), ("CHROM", "hr_chrom", "conf_chrom"),
-              ("green", "hr_green", "conf_green")]
-    model_hr = np.array([fnum(r.get("hr_model")) for r in rows])
-    has_model = np.isfinite(model_hr).sum() >= 5
-    if has_model:
-        panels.append(("model", "hr_model", None))
-
-    fin = lab[np.isfinite(lab)]
-    lim = [max(30, np.floor(fin.min() / 10) * 10 - 5), np.ceil(fin.max() / 10) * 10 + 5]
-
-    n = len(panels)
-    fig, axs = plt.subplots(1, n, figsize=(5.3 * n, 5.4))
-    if n == 1:
-        axs = [axs]
-    for ax, (name, hc, cc) in zip(axs, panels):
-        hr = np.array([fnum(r.get(hc)) for r in rows])
-        ok = np.isfinite(hr) & np.isfinite(lab)
-        if ok.sum() == 0:
-            ax.set_title(f"{name}: no scorable segments"); ax.set_xlim(lim); ax.set_ylim(lim)
-            continue
-        if cc is not None:                       # DSP method: split by confidence
-            cf = np.array([fnum(r.get(cc)) for r in rows])
-            thr = np.nanmedian(cf[ok])
-            hi = ok & (cf >= thr); lo = ok & (cf < thr)
-            ax.scatter(lab[lo], hr[lo], s=10, facecolors="none", edgecolors="#bbbbbb",
-                       linewidths=0.6, label=f"low conf (<{thr:.0f})")
-            ax.scatter(lab[hi], hr[hi], s=12, alpha=0.5, color="#1f77b4",
-                       label=f"high conf (\u2265{thr:.0f})")
-        else:                                    # model: single colour (no confidence column)
-            ax.scatter(lab[ok], hr[ok], s=12, alpha=0.5, color="purple", label="model")
-        ax.plot(lim, lim, "k--", lw=1)
-        ae = np.abs(hr - lab)
-        mae, bias, w6 = np.nanmean(ae[ok]), np.nanmean((hr - lab)[ok]), np.mean(ae[ok] <= 6) * 100
-        extra = ""
-        if cc is not None:
-            cf = np.array([fnum(r.get(cc)) for r in rows])
-            hi = ok & (cf >= np.nanmedian(cf[ok]))
-            if hi.any():
-                extra = f"  |  hi-conf: MAE {np.nanmean(ae[hi]):.1f}, w6 {np.mean(ae[hi] <= 6)*100:.0f}%"
-        ax.set_title(f"{name}\nMAE {mae:.1f}, bias {bias:+.1f}, w6 {w6:.0f}%{extra}", fontsize=10)
-        ax.set_xlabel("PPG label HR (BPM)"); ax.set_xlim(lim); ax.set_ylim(lim)
-        ax.grid(alpha=0.3); ax.legend(fontsize=8, loc="upper left")
-    axs[0].set_ylabel("predicted HR (BPM)")
-    fig.suptitle(f"HR accuracy vs PPG label — {int(np.isfinite(lab).sum())} labeled segments"
-                 + ("  (incl. trained model)" if has_model else ""), fontweight="bold")
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    out_png = os.path.join(out_dir, "hr_accuracy.png")
-    plt.savefig(out_png, dpi=130)
-    plt.close()
-    return out_png
-
-
-def write_condition_plot(rows, out_dir):
-    """Grouped bar chart of MAE broken down by CONDITION (exercise state x camera) for
-    each method (POS/CHROM/green, + model if present). Shows *where* each method fails:
-    tall bars = high error. Also writes hr_by_condition.csv with MAE / within-6 / n per
-    (method, state, camera) cell. The clip name encodes state ('before'/'after') and
-    camera, so no extra inputs are needed."""
-    def fnum(v):
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return np.nan
-
-    lab = np.array([fnum(r.get("hr_label")) for r in rows])
-    if np.isfinite(lab).sum() < 5:
-        return None
-
-    cameras = list(getattr(config, "CAMERAS", ("FullHDwebcam", "IriunWebcam", "USBVideo")))
-
-    def parse(clip):
-        cam = next((c for c in cameras if c in clip), "other")
-        state = "after" if "after" in clip else ("before" if "before" in clip else "?")
-        return cam, state
-
-    cams = [parse(r.get("clip", ""))[0] for r in rows]
-    states = [parse(r.get("clip", ""))[1] for r in rows]
-
-    methods = [("POS", "hr_pos"), ("CHROM", "hr_chrom"), ("green", "hr_green")]
-    if np.isfinite(np.array([fnum(r.get("hr_model")) for r in rows])).sum() >= 5:
-        methods.append(("model", "hr_model"))
-
-    conds = [(st, cam) for st in ("before", "after") for cam in cameras]
-
-    def stats(hrcol, st, cam):
-        hr = np.array([fnum(r.get(hrcol)) for r in rows])
-        sel = np.array([(states[i] == st and cams[i] == cam) for i in range(len(rows))])
-        ok = sel & np.isfinite(hr) & np.isfinite(lab)
-        if ok.sum() == 0:
-            return np.nan, np.nan, 0
-        ae = np.abs(hr - lab)[ok]
-        return float(np.mean(ae)), float(np.mean(ae <= 6) * 100), int(ok.sum())
-
-    table = {(mn, st, cam): stats(mc, st, cam) for mn, mc in methods for st, cam in conds}
-
-    # ---- bar chart ----
-    colors = {"POS": "#1f77b4", "CHROM": "#ff7f0e", "green": "#2ca02c", "model": "purple"}
-    x = np.arange(len(conds))
-    w = 0.8 / len(methods)
-    fig, ax = plt.subplots(figsize=(14, 6))
-    for j, (mn, _) in enumerate(methods):
-        vals = [table[(mn, st, cam)][0] for st, cam in conds]
-        ax.bar(x + (j - (len(methods) - 1) / 2) * w, vals, w, label=mn, color=colors.get(mn))
-    ax.axhline(6, ls="--", c="gray", lw=1, label="6 BPM (good)")
-    ax.set_xticks(x)
-    ax.set_xticklabels([f"{st}\n{cam.replace('webcam', '').replace('Video', '')}" for st, cam in conds], fontsize=9)
-    ax.set_ylabel("MAE (BPM) — lower is better")
-    ax.set_title("HR error by condition (exercise state \u00d7 camera) and method", fontweight="bold")
-    ax.legend(ncol=len(methods) + 1, fontsize=9)
-    ax.grid(axis="y", alpha=0.3)
-    ymax = ax.get_ylim()[1]
-    for i, (st, cam) in enumerate(conds):
-        ax.text(i, -0.06 * ymax, f"n={table[(methods[0][0], st, cam)][2]}", ha="center", fontsize=8, color="gray")
-    plt.tight_layout()
-    out_png = os.path.join(out_dir, "hr_accuracy_by_condition.png")
-    plt.savefig(out_png, dpi=130)
-    plt.close()
-
-    # ---- metrics CSV ----
-    with open(os.path.join(out_dir, "hr_by_condition.csv"), "w", newline="", encoding="utf-8") as fh:
-        wr = csv.writer(fh)
-        wr.writerow(["method", "state", "camera", "mae", "within6_pct", "n"])
-        for mn, _ in methods:
-            for st, cam in conds:
-                mae, w6, n = table[(mn, st, cam)]
-                wr.writerow([mn, st, cam, f"{mae:.2f}" if np.isfinite(mae) else "", f"{w6:.1f}" if np.isfinite(w6) else "", n])
-    return out_png
-
-
-def write_hb_accuracy_plot(rows, out_dir):
-    """Scatter of predicted vs true Hb (g/dL), y=x line, MAE/bias/Pearson-r annotated.
-
-    Hb is per-subject (constant across a subject's segments), so many points overlap at
-    the same true value — that's expected. Also reports a per-SUBJECT scatter (one point
-    per subject, averaging that subject's segment predictions) since subject-level is the
-    honest granularity for a per-subject quantity. Skipped if fewer than 5 segments have
-    both a prediction and a ground-truth value."""
-    def fnum(v):
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return np.nan
-
-    pred = np.array([fnum(r.get("hb_pred")) for r in rows])
-    true = np.array([fnum(r.get("hb_true")) for r in rows])
-    ok = np.isfinite(pred) & np.isfinite(true)
-    if ok.sum() < 5:
-        print("  (Hb accuracy plot skipped: fewer than 5 segments with both prediction and truth)")
-        return None
-
-    # per-subject aggregate (mean prediction per subject vs its constant true Hb)
-    subj = np.array([re.match(r"(\d+)", r.get("clip", "") or r.get("segment", "")).group(1)
-                     if re.match(r"(\d+)", r.get("clip", "") or r.get("segment", "")) else "?"
-                     for r in rows])
-    subj_pred, subj_true = {}, {}
-    for i in np.where(ok)[0]:
-        subj_pred.setdefault(subj[i], []).append(pred[i])
-        subj_true[subj[i]] = true[i]
-    s_ids = sorted(subj_pred)
-    sp_mean = np.array([np.mean(subj_pred[s]) for s in s_ids])
-    st_val = np.array([subj_true[s] for s in s_ids])
-
-    def stats(p, t):
-        ae = np.abs(p - t)
-        mae = float(np.mean(ae)); bias = float(np.mean(p - t))
-        r = float(np.corrcoef(p, t)[0, 1]) if len(p) > 1 and np.std(p) > 0 and np.std(t) > 0 else float("nan")
-        # R^2 = coefficient of determination of predictions vs the y=x line (variance of
-        # true Hb explained by the prediction). Can be negative if worse than predicting mean.
-        ss_res = float(np.sum((t - p) ** 2))
-        ss_tot = float(np.sum((t - np.mean(t)) ** 2))
-        r2 = (1.0 - ss_res / ss_tot) if ss_tot > 1e-12 else float("nan")
-        return mae, bias, r, r2
-
-    seg_mae, seg_bias, seg_r, seg_r2 = stats(pred[ok], true[ok])
-    sub_mae, sub_bias, sub_r, sub_r2 = stats(sp_mean, st_val)
-
-    # naive baseline: predict the mean true Hb for everyone (does the model beat guessing?)
-    naive_seg_mae = float(np.mean(np.abs(np.mean(true[ok]) - true[ok])))
-    naive_sub_mae = float(np.mean(np.abs(np.mean(st_val) - st_val))) if len(st_val) else float("nan")
-    mean_hb_seg = float(np.mean(true[ok]))
-    mean_hb_sub = float(np.mean(st_val)) if len(st_val) else float("nan")
-
-    allv = np.concatenate([true[ok], pred[ok]])
-    lim = [np.floor(np.nanmin(allv)) - 0.5, np.ceil(np.nanmax(allv)) + 0.5]
-
-    fig, axs = plt.subplots(1, 2, figsize=(11, 5.4))
-    # per-segment
-    axs[0].scatter(true[ok], pred[ok], s=12, alpha=0.4, color="#8c564b", label="segment")
-    axs[0].plot(lim, lim, "k--", lw=1); axs[0].set_xlim(lim); axs[0].set_ylim(lim)
-    axs[0].axhline(mean_hb_seg, color="gray", ls=":", lw=1.2, label=f"naive=mean Hb ({mean_hb_seg:.1f})")
-    axs[0].set_xlabel("true Hb (g/dL)"); axs[0].set_ylabel("predicted Hb (g/dL)")
-    verdict0 = "BEATS naive" if seg_mae < naive_seg_mae else "WORSE than naive"
-    axs[0].set_title(f"per-segment\nmodel MAE {seg_mae:.2f}  |  naive MAE {naive_seg_mae:.2f}  ({verdict0})\n"
-                     f"bias {seg_bias:+.2f}, r {seg_r:.2f}, R\u00b2 {seg_r2:.2f}  (n={int(ok.sum())})", fontsize=9)
-    axs[0].legend(fontsize=8, loc="upper left"); axs[0].grid(alpha=0.3)
-    # per-subject
-    axs[1].scatter(st_val, sp_mean, s=40, alpha=0.7, color="#9467bd", edgecolors="k", linewidths=0.5, label="subject")
-    axs[1].plot(lim, lim, "k--", lw=1); axs[1].set_xlim(lim); axs[1].set_ylim(lim)
-    axs[1].axhline(mean_hb_sub, color="gray", ls=":", lw=1.2, label=f"naive=mean Hb ({mean_hb_sub:.1f})")
-    axs[1].set_xlabel("true Hb (g/dL)"); axs[1].set_ylabel("mean predicted Hb (g/dL)")
-    verdict1 = "BEATS naive" if sub_mae < naive_sub_mae else "WORSE than naive"
-    axs[1].set_title(f"per-subject (mean pred)\nmodel MAE {sub_mae:.2f}  |  naive MAE {naive_sub_mae:.2f}  ({verdict1})\n"
-                     f"bias {sub_bias:+.2f}, r {sub_r:.2f}, R\u00b2 {sub_r2:.2f}  ({len(s_ids)} subjects)", fontsize=9)
-    axs[1].legend(fontsize=8, loc="upper left"); axs[1].grid(alpha=0.3)
-    fig.suptitle("Hb accuracy — predicted vs true (naive = predict mean Hb)", fontweight="bold")
-    plt.tight_layout(rect=[0, 0, 1, 0.94])
-    out_png = os.path.join(out_dir, "hb_accuracy.png")
-    plt.savefig(out_png, dpi=130)
-    plt.close()
-    return out_png
-
-
-def main():
-    ap = argparse.ArgumentParser(description="HR (DSP + trained model) and Hb prediction over train_data segments.")
-    ap.add_argument("--segments-dir", default="output/train_data")
+def main() -> None:
+    """
+    Predict HR and Hb over dataset segments.
+    """
+    # Parse arguments.
+    ap = argparse.ArgumentParser(
+        description="HR (DSP + trained model) and Hb prediction over dataset segments."
+    )
+    ap.add_argument("--dataset-dir", default="output/dataset")
+    ap.add_argument("--manifest", default="output/dataset/segments_manifest.csv")
     ap.add_argument("--ppg-dir", default="data/ppg")
     ap.add_argument("--out-dir", default="output/prediction")
-    ap.add_argument("--manifest", default=None,
-                    help="segments_manifest.csv (default: <segments-dir>/segments_manifest.csv)")
-    ap.add_argument("--no-plot", action="store_true")
-    ap.add_argument("--hr-model", default=None,
-                    help="optional path to a trained HR model (hr_model.pt). If given, its "
-                         "prediction fills the hr_model column and the model panel/spectrum.")
-    ap.add_argument("--hb-model", default=None,
-                    help="optional path to a trained Hb model (hb_model.pt). If given, its "
-                         "hemoglobin prediction fills the hb_pred column and the plot title. "
-                         "Hb is per-subject, so the value repeats across a subject's segments.")
-    ap.add_argument("--ground-truth", default=None,
-                    help="optional ground_truth.csv (patient_id,hemoglobin,...). If given, the "
-                         "true Hb per subject is shown on each plot next to the prediction and a "
-                         "Hb accuracy scatter (hb_accuracy.png) is written.")
-    ap.add_argument("--workers", type=int, default=0)
+    ap.add_argument("--no-plot", action="store_true", help="Disable prediction plots.")
+    ap.add_argument("--hr-model", default=None, help="Optional path to a trained HR model.")
+    ap.add_argument("--hb-model", default=None, help="Optional path to a trained Hb model.")
+    ap.add_argument("--workers", type=int, default=0,
+        help="Number of worker processes (0 = all available cores)."
+    )
     args = ap.parse_args()
 
+    # Create the output directory.
     os.makedirs(args.out_dir, exist_ok=True)
-    seg_files = sorted(glob.glob(os.path.join(args.segments_dir, "*_signals.npz")))
-    print(f"{len(seg_files)} segment file(s) in {args.segments_dir}")
+    # Cache PPG files so each file is loaded only once.
+    ppg_cache: dict[str, PPGSignal] = {}
+    # Build prediction tasks.
+    tasks: list[PredictionTask] = []
 
-    # manifest: segment -> span
-    man_path = args.manifest or os.path.join(args.segments_dir, "segments_manifest.csv")
-    spans = {}
-    if os.path.exists(man_path):
-        for r in csv.DictReader(open(man_path, encoding="utf-8-sig")):
-            spans[r["segment"]] = {"clip": r["clip"], "t_start": float(r["t_start"]),
-                                   "t_end": float(r["t_end"])}
-        print(f"manifest: {len(spans)} segment spans from {man_path}")
-    else:
-        print(f"WARNING: no manifest at {man_path} — segments will be UNLABELLED "
-              f"(re-run prepare_dataset to generate it).")
+    # Load segment metadata from the manifest
+    manifest = None
+    if not os.path.exists(args.manifest):
+        raise FileNotFoundError(f"Manifest file not found: {args.manifest}")
+    with open(args.manifest, encoding="utf-8-sig", newline="") as file:
+        manifest = list(csv.DictReader(file))
+    print(f"Loaded {len(manifest)} segment(s)")
 
-    # index PPG by (subject, state), loaded once
-    ppg_cache = {}
-    for fp in glob.glob(os.path.join(args.ppg_dir, "*.PW")) + glob.glob(os.path.join(args.ppg_dir, "*.pw")):
-        m = re.search(r"(\d+)_(before|after)", os.path.basename(fp), re.IGNORECASE)
-        if m:
-            ppg_cache[(m.group(1), m.group(2).lower())] = load_pw(fp)
-    print(f"{len(ppg_cache)} PPG file(s) indexed")
-
-    # optional ground-truth from CSV. Rows are indexed under MULTIPLE candidate keys so the
-    # same loader serves both datasets: the 'video' filename stem (custom ICU clips, whose
-    # name is e.g. 20260622_192309_10.84.12.104), the raw patient_id, and patient_id's
-    # numeric prefix (MCD, e.g. 1020). Each segment is later matched against these.
-    hb_by_key = {}
-    pulse_by_key = {}
-    has_pulse_col = False
-
-    def _index_row(keys, hbv, pv):
-        for k in keys:
-            if not k:
-                continue
-            if hbv is not None and k not in hb_by_key:
-                hb_by_key[k] = hbv
-            if pv is not None and k not in pulse_by_key:
-                pulse_by_key[k] = pv
-
-    if args.ground_truth and os.path.exists(args.ground_truth):
-        with open(args.ground_truth, encoding="utf-8-sig") as fh:
-            reader = csv.DictReader(fh)
-            cols = reader.fieldnames or []
-            has_pulse_col = "pulse" in cols
-            for r in reader:
-                pid = str(r.get("patient_id", "")).strip()
-                video = str(r.get("video", "")).strip()
-                video_stem = re.sub(r"\.(mkv|mp4|avi|mov)$", "", video, flags=re.IGNORECASE)
-                num = re.match(r"(\d+)", pid)
-                num_prefix = num.group(1) if num else None
-                # parse Hb
-                hbv = None
-                hbs = r.get("hemoglobin", "")
-                if hbs not in ("", "None", None):
-                    try:
-                        hbv = float(hbs)
-                    except ValueError:
-                        pass
-                # parse pulse
-                pv = None
-                if has_pulse_col:
-                    ps = r.get("pulse", "")
-                    if ps not in ("", "None", None):
-                        try:
-                            pv = float(ps)
-                        except ValueError:
-                            pass
-                # index under all candidate keys (video stem is the most specific)
-                _index_row([video_stem, pid, num_prefix], hbv, pv)
-        n_hb = len(set(hb_by_key.values())) if hb_by_key else 0
-        print(f"ground-truth: {len(hb_by_key)} key(s) indexed ({n_hb} distinct Hb values) from {args.ground_truth}")
-        if has_pulse_col:
-            print(f"ground-truth: 'pulse' column present — used as HR label ONLY for clips with no PPG file")
-    elif args.ground_truth:
-        print(f"WARNING: ground-truth CSV not found at {args.ground_truth}; Hb/pulse shown without truth")
-
-    def _lookup(mapping, clip_name, subj):
-        """Try the full clip name (matches a video stem) first, then the numeric subject
-        (matches MCD patient_id / its numeric prefix)."""
-        if clip_name and clip_name in mapping:
-            return mapping[clip_name]
-        if subj and subj in mapping:
-            return mapping[subj]
-        return None
-
-    tasks = []
-    n_ppg, n_pulse, n_none = 0, 0, 0
-    for sp_path in seg_files:
-        seg_name = os.path.basename(sp_path).replace("_signals.npz", "")
-        span = spans.get(seg_name)
-        clip_name = span["clip"] if span else re.sub(r"_\d+$", "", seg_name)
-        subj, state = parse_clip_state(clip_name)
-        # HR label per clip: PREFER the PPG waveform if this clip has a PPG file; only when
-        # there is no PPG do we fall back to the CSV 'pulse' number (custom dataset).
-        ppg_info = ppg_cache.get((subj, state)) if subj and state else None
-        pulse_lbl = _lookup(pulse_by_key, clip_name, subj)
-        if ppg_info is not None:
-            pulse_hr = None                       # PPG available -> plot the waveform
-            n_ppg += 1
-        elif pulse_lbl is not None:
-            pulse_hr = pulse_lbl                  # no PPG -> use CSV pulse label
-            n_pulse += 1
-        else:
-            pulse_hr = None                       # no PPG and no pulse -> unlabeled
-            n_none += 1
-        hb_true = _lookup(hb_by_key, clip_name, subj)
-        tasks.append((seg_name, sp_path, span, ppg_info, args.out_dir, args.no_plot,
-                      args.hr_model, args.hb_model, hb_true, pulse_hr))
-    print(f"HR labels: {n_ppg} segment(s) from PPG waveform, {n_pulse} from CSV pulse (no PPG), "
-          f"{n_none} unlabeled")
-
-    if not tasks:
-        print("nothing to process.")
+    if not manifest:
+        print("Nothing to process.")
         return
 
-    n_workers = args.workers if args.workers and args.workers > 0 else _default_workers()
-    n_workers = max(1, min(n_workers, len(tasks)))
-    rows = []
-    if n_workers == 1:
-        for i, task in enumerate(tasks, 1):
-            nm, row, err = process_segment(task)
-            print(f"[{i}/{len(tasks)}] {nm}: {'ok' if row else 'ERROR ' + err}")
-            if row:
-                rows.append(row)
-    else:
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            futs = {pool.submit(process_segment, t): t[0] for t in tasks}
-            for i, fut in enumerate(as_completed(futs), 1):
-                nm, row, err = fut.result()
-                print(f"[{i}/{len(tasks)}] {nm}: {'ok' if row else 'ERROR ' + err}")
-                if row:
-                    rows.append(row)
+    for row in manifest:
+        segment_name = row["segment"]
+        sample_path = os.path.join(args.dataset_dir, segment_name + FileExtension.DATASET_SAMPLE)
+        if not os.path.exists(sample_path):
+            print(f"WARNING: sample missing: {sample_path}")
+            continue
 
-    rows.sort(key=lambda r: r["segment"])
+        # Load the PPG referenced by this segment
+        ppg_info = None
+        ppg_file = row.get("ppg_file", "").strip()
+        if ppg_file:
+            if ppg_file not in ppg_cache:
+                ppg_path = os.path.join(args.ppg_dir, ppg_file)
+                if os.path.exists(ppg_path):
+                    ppg_cache[ppg_file] = load_pw(ppg_path)
+                else:
+                    print(f"WARNING: PPG file missing: {ppg_path}")
+            ppg_info = ppg_cache.get(ppg_file)
+
+        # Create the segment/window metadata required by PredictionTask
+        window = WindowInfo(
+            segment=segment_name,
+            clip=row["clip"],
+            index=int(row["index"]),
+            t_start=float(row["t_start"]),
+            t_end=float(row["t_end"]),
+            abs_start=float(row["abs_start"]),
+        )
+
+        # Create the prediction task
+        tasks.append(PredictionTask(
+            name=segment_name,
+            sample_path=sample_path,
+            segment=window,
+            ppg_info=ppg_info,
+            output_dir=args.out_dir,
+            no_plot=args.no_plot,
+            hr_model=args.hr_model,
+            hb_model=args.hb_model,
+            hr_true=float(row["ppg_hr"]) if row.get("ppg_hr") else float(row["pulse"]),
+            hb_true=float(row["hemoglobin"])
+        ))
+
+    print(f"Created {len(tasks)} prediction task(s)")
+    if not tasks:
+        print("Nothing to process.")
+        return
+
+    # Process prediction tasks in parallel
+    predictions: list[PredictionResult] = []
+    workers = min(args.workers if args.workers > 0 else _default_workers(), len(tasks))
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(process_segment, task): task.name for task in tasks}
+        # Collect results as workers finish
+        for index, future in enumerate(as_completed(futures), 1):
+            prediction = future.result()
+            if prediction.success:
+                print(f"[{index}/{len(tasks)}] {prediction.name}: ok")
+                predictions.append(prediction)
+            else:
+                print(f"[{index}/{len(tasks)}] {prediction.name}: ERROR {prediction.error}")
+
+    # Sort prediction results
+    predictions.sort(key=lambda result: (result.prediction.segment if result.prediction else result.name))
+
+    # Save prediction results to CSV
     csv_path = os.path.join(args.out_dir, "hr_results.csv")
-    fields = ["segment", "clip", "t_start", "t_end", "hr_pos", "conf_pos", "hr_chrom",
-              "conf_chrom", "hr_green", "conf_green", "hr_label", "hr_model", "hb_pred", "hb_true"]
-    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=fields)
-        w.writeheader()
-        w.writerows(rows)
-    print(f"\n{len(rows)} segment(s) -> {csv_path}")
+    field_names = [field.name for field in fields(PredictionRecord)]
+    with open(csv_path, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=field_names)
+        writer.writeheader()
+        writer.writerows(
+            asdict(result.prediction) for result in predictions if result.prediction is not None
+        )
 
-    # aggregate per-method standings vs the PPG label (raw FFT argmax, no best-of-three)
-    def col(name):
-        return np.array([float(r[name]) if r.get(name, "") not in ("", None) else np.nan for r in rows])
+    print(f"\nGenerated {len(predictions)} prediction result(s)")
+    print(f"Results -> {csv_path}")
+
+    # Build rows for accuracy reporting and visualization.
+    rows = [asdict(result.prediction) for result in predictions if result.prediction is not None]
+
+    # Convert a CSV value to float, returning NaN for missing values.
+    def col(name: str) -> np.ndarray:
+        return np.array([float(row[name]) if row.get(name, "") not in ("", None) else np.nan for row in rows ])
+
+    # Print aggregate HR accuracy for each prediction method.
     lab = col("hr_label")
     if np.isfinite(lab).sum() >= 5:
-        print("\n=== per-method accuracy vs PPG label (all labeled segments) ===")
-        for name in ("hr_pos", "hr_chrom", "hr_green", "hr_model"):
+        print("\n=== HR accuracy vs PPG label ===")
+        for name in ("hr_pos", "hr_chrom", "hr_green", "hr_pred"):
             hr = col(name)
             ok = np.isfinite(hr) & np.isfinite(lab)
             if ok.sum() == 0:
                 continue
-            ae = np.abs(hr - lab)[ok]
+            error = np.abs(hr - lab)[ok]
             bias = np.mean((hr - lab)[ok])
             label = name.replace("hr_", "")
-            print(f"  {label:6} MAE {np.mean(ae):6.2f}  w6 {np.mean(ae <= 6)*100:4.0f}%  bias {bias:+6.2f}  (n={ok.sum()})")
+            print(
+                f"  {label:6} MAE {np.mean(error):6.2f}  w6 {np.mean(error <= 6) * 100:4.0f}%  "
+                f"bias {bias:+6.2f}  (n={ok.sum()})"
+            )
 
-    # Hb accuracy summary vs ground truth (per-segment and per-subject)
-    hb_p = col("hb_pred"); hb_t = col("hb_true")
-    okhb = np.isfinite(hb_p) & np.isfinite(hb_t)
-    if okhb.sum() >= 5:
-        p, t = hb_p[okhb], hb_t[okhb]
-        ae = np.abs(p - t)
-        bias = np.mean(p - t)
-        r = np.corrcoef(p, t)[0, 1] if np.std(p) > 0 else float("nan")
-        ss_res = np.sum((t - p) ** 2); ss_tot = np.sum((t - np.mean(t)) ** 2)
-        r2 = (1.0 - ss_res / ss_tot) if ss_tot > 1e-12 else float("nan")
-        naive_mae = np.mean(np.abs(np.mean(t) - t))
-        print("\n=== Hb accuracy vs ground truth (per-segment) ===")
-        print(f"  Hb     MAE {np.mean(ae):6.2f} g/dL  bias {bias:+6.2f}  r {r:.2f}  R2 {r2:.2f}  (n={int(okhb.sum())})")
-        print(f"  naive  MAE {naive_mae:6.2f} g/dL  (predict mean Hb) -> model "
-              f"{'BEATS' if np.mean(ae) < naive_mae else 'does NOT beat'} naive")
+    # Print aggregate Hb accuracy against the ground truth.
+    hb_pred = col("hb_pred")
+    hb_true = col("hb_label")
+    ok_hb = np.isfinite(hb_pred) & np.isfinite(hb_true)
+    if ok_hb.sum() >= 5:
+        pred = hb_pred[ok_hb]
+        true = hb_true[ok_hb]
+        error = np.abs(pred - true)
+        bias = np.mean(pred - true)
+        correlation = np.corrcoef(pred, true)[0, 1] if np.std(pred) > 0 and np.std(true) > 0 else float("nan")
+        ss_res = np.sum((true - pred) ** 2)
+        ss_tot = np.sum((true - np.mean(true)) ** 2)
+        r2 = 1.0 - (ss_res / ss_tot) 
+        naive_mae = np.mean(np.abs(np.mean(true) - true))
 
+        print("\n=== Hb accuracy vs ground truth ===")
+        print(
+            f"  Hb     MAE {np.mean(error):6.2f} g/dL  bias {bias:+6.2f}  "
+            f"r {correlation:.2f}  R2 {r2:.2f}  (n={int(ok_hb.sum())})"
+        )
+        print(
+            f"  naive  MAE {naive_mae:6.2f} g/dL  (predict mean Hb) -> model "
+            f"{'BEATS' if np.mean(error) < naive_mae else 'does NOT beat'} naive"
+        )
+
+    # Generate final aggregate plots.
     if not args.no_plot:
-        acc = write_accuracy_plot(rows, args.out_dir)
-        if acc:
-            print(f"accuracy plot -> {acc}")
-        cond = write_condition_plot(rows, args.out_dir)
-        if cond:
-            print(f"by-condition plot -> {cond}")
-            print(f"by-condition metrics -> {os.path.join(args.out_dir, 'hr_by_condition.csv')}")
-        hb_acc = write_hb_accuracy_plot(rows, args.out_dir)
-        if hb_acc:
-            print(f"Hb accuracy plot -> {hb_acc}")
+        accuracy_plot = write_accuracy_plot(rows, args.out_dir)
+        if accuracy_plot:
+            print(f"accuracy plot -> {accuracy_plot}")
+        hb_accuracy_plot = write_hb_accuracy_plot(rows, args.out_dir)
+        if hb_accuracy_plot:
+            print(f"Hb accuracy plot -> {hb_accuracy_plot}")
 
 
 if __name__ == "__main__":

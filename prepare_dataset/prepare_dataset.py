@@ -307,9 +307,6 @@ def process_dataset_task(task: DatasetTask) -> DatasetResult:
         )
 
 
-# ============================================================================
-# Command line interface
-# ============================================================================
 def main() -> None:
     """
     Generate uniformly sampled dataset windows from extracted rPPG signals.

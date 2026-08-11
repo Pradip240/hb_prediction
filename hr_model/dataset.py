@@ -87,17 +87,26 @@ class SpectralDataset(Dataset[tuple[Tensor, Tensor]]):
         return len(self.samples)
 
 
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
+    @staticmethod
+    def prepare_signal(path: str) -> Tensor:
         """
-        Load one training sample.
+        Load and preprocess one prepared signal segment.
+
+        The preprocessing performed here is identical to the preprocessing
+        used during training. The input archive contains RGB signals with
+        shape (T, R, 3) and pixel counts with shape (T, R).
+
+        The data is converted as follows:
+            (T, R, 3) + (T, R, 1) -> (T, R, 4) -> (R, 4, T) -> (R * 4, T)
+
+        Each resulting channel is independently z-score normalized over time.
+
+        Args:
+            path: Path to the prepared signal archive.
 
         Returns:
-            Tuple containing:
-                - Input signal with shape (R * 4, T).
-                - Heart-rate target with shape ().
+            Preprocessed input signal with shape (R * 4, T).
         """
-        path, heart_rate = self.samples[index]
-
         data = np.load(path)
         signals = np.asarray(data["signals"], dtype=np.float32)
         pixel_counts = np.asarray(data["pixel_counts"], dtype=np.float32)
@@ -113,7 +122,6 @@ class SpectralDataset(Dataset[tuple[Tensor, Tensor]]):
 
         # Replace NaN RGB values from undetected regions with zero.
         signals = np.nan_to_num(signals, nan=0.0)
-
         # Add pixel count as the fourth feature for every region.
         features = np.concatenate([signals, pixel_counts[..., None]], axis=-1)
         # Convert: (T, R, 4) to (R, 4, T)
@@ -125,7 +133,28 @@ class SpectralDataset(Dataset[tuple[Tensor, Tensor]]):
         mean = np.mean(features, axis=1, keepdims=True)
         std = np.std(features, axis=1, keepdims=True)
         features = (features - mean) / (std + 1e-6)
-        return torch.from_numpy(features), torch.tensor(heart_rate, dtype=torch.float32) # type: ignore
+        return torch.from_numpy(features) # type: ignore
+
+
+    def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
+        """
+        Load one training sample.
+
+        The signal preprocessing is delegated to prepare_signal() so that
+        training and inference use exactly the same input transformation.
+
+        Args:
+            index: Dataset sample index.
+
+        Returns:
+            Tuple containing:
+                - Input signal with shape (R * 4, T).
+                - Heart-rate target with shape ().
+        """
+        path, heart_rate = self.samples[index]
+        # Prepare the input signal using the same preprocessing used for prediction.
+        signal = self.prepare_signal(path)
+        return signal, torch.tensor(heart_rate, dtype=torch.float32)
 
 
 def load_dataset(segments_dir: str, manifest: str) -> SpectralDataset:

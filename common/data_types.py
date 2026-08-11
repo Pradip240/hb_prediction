@@ -176,21 +176,22 @@ class PredictionTask:
         ppg_info: Reference PPG data for the sample's subject and state.
         output_dir: Directory where prediction outputs are written.
         no_plot: Whether prediction plotting is disabled.
-        hr_model: Path to the optional trained HR model.
-        hb_model: Path to the optional trained Hb model.
+        hr_true: Ground-truth pulse value used when no PPG is available.
         hb_true: Ground-truth hemoglobin value for the subject.
-        pulse_hr: Ground-truth pulse value used when no PPG is available.
+        hr_model: Path to the trained HR model.
+        hb_model: Path to the trained Hb model.
     """
     name: str
     sample_path: str
-    segment: WindowInfo | None
+    segment: WindowInfo
     ppg_info: PPGSignal | None
     output_dir: str
     no_plot: bool
+    hr_true: float | None
+    hb_true: float | None
     hr_model: str | None
     hb_model: str | None
-    hb_true: float | None
-    pulse_hr: float | None
+    
 
 
 @dataclass(slots=True, frozen=True)
@@ -210,11 +211,10 @@ class PredictionRecord:
         hr_green: Green-channel heart rate.
         conf_green: Green-channel confidence.
         hr_label: Ground-truth heart rate.
-        hr_model: Trained HR model prediction.
-        hr_model_conf: Trained HR model confidence.
+        hr_pred: Trained HR model prediction.
+        hr_pred_conf: Trained HR model confidence.
+        hb_label: Ground-truth hemoglobin value.
         hb_pred: Trained hemoglobin model prediction.
-        hb_model_conf: Trained hemoglobin model confidence.
-        hb_true: Ground-truth hemoglobin value.
     """
     segment: str
     clip: str
@@ -227,11 +227,10 @@ class PredictionRecord:
     hr_green: float | None
     conf_green: float | None
     hr_label: float | None
-    hr_model: float | None
-    hr_model_conf: float | None
+    hr_pred: float | None
+    hr_pred_conf: float | None
+    hb_label: float | None
     hb_pred: float | None
-    hb_model_conf: float | None
-    hb_true: float | None
 
 
 @dataclass(slots=True, frozen=True)

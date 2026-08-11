@@ -261,10 +261,6 @@ def process_clip(task: ClipTask) -> ClipResult:
         return ClipResult(task.name, f"{task.name}: ERROR {type(exc).__name__}: {exc}", False)
 
 
-
-# ============================================================================
-# Command line interface
-# ============================================================================
 def main() -> None:
     """
     Extract rPPG signals for all videos in a directory.
