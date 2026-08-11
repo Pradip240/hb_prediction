@@ -62,7 +62,9 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 
 from common import config
-from common.data_types import DatasetTask, DatasetResult, FileExtension, WindowInfo
+from common.data_types import DatasetTask, DatasetResult, FileExtension, WindowInfo, PPGSignal
+from common.ppg import load_pw, ppg_segment
+from common.signal_processing import spectral_hr
 from prepare_dataset.window_generation import find_windows
 from prepare_dataset.signal_interpolation import resample_region_signals, resample_pixel_counts
 
@@ -80,7 +82,7 @@ def _default_workers() -> int:
         return os.cpu_count() or 1
 
 
-def _write_manifest(windows: list[WindowInfo], output_dir: str) -> None:
+def _write_manifest(windows: list[WindowInfo], output_dir: str, ppg_dir: str, ground_truth: str) -> None:
     """
     Save metadata describing every emitted dataset window.
 
@@ -90,8 +92,46 @@ def _write_manifest(windows: list[WindowInfo], output_dir: str) -> None:
     Args:
         windows: Metadata for all emitted windows.
         output_dir: Dataset output directory.
+        ppg_dir: Directory containing the contact PPG files. 
+        ground_truth: Path to the ground-truth CSV file.
     """
     windows.sort(key=lambda window: (window.clip, window.index))
+
+    # Store ground-truth and PPG metadata by clip name.
+    ground_truth_data: dict[str, tuple[str, float, float, str, PPGSignal | None]] = {}
+
+    with open(ground_truth, encoding="utf-8-sig", newline="") as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            video = row["video"].strip()
+            clip = os.path.splitext(os.path.basename(video))[0]
+            patient_id = row["patient_id"].strip()
+            if not patient_id:
+                continue
+            pulse = float(row["pulse"])
+            hemoglobin = float(row["hemoglobin"])
+
+            # Default values when no matching PPG file is available.
+            ppg_file = ""
+            ppg_data = None
+
+            # Add PPG data if available
+            parts = clip.split("_")
+            if len(parts) > 2:
+                subject_id = parts[0]
+                state = parts[2]
+                ppg_file = os.path.join(ppg_dir, f"{subject_id}_{state}.PW")
+                if os.path.isfile(ppg_file):
+                    ppg_data = load_pw(ppg_file)
+
+            # Store all metadata so it can be added to every segment generated from this clip.
+            ground_truth_data[clip] = (
+                patient_id,
+                pulse,
+                hemoglobin,
+                ppg_file,
+                ppg_data
+            )
 
     manifest_path = os.path.join(output_dir, "segments_manifest.csv")
 
@@ -105,9 +145,45 @@ def _write_manifest(windows: list[WindowInfo], output_dir: str) -> None:
             "t_start",
             "t_end",
             "abs_start",
+            "patient_id",
+            "pulse",
+            "hemoglobin",
+            "ppg_file",
+            "ppg_hr",
+            "ppg_start",
+            "ppg_end",
+            "ppg_sampling_frequency"
         ])
 
-        for window in windows:
+        for index, window in enumerate(windows, 1):
+            print(f"[{index}/{len(windows)}] {window.segment}")
+            # Match each generated segment with its clip-level ground-truth and PPG metadata.
+            data = ground_truth_data.get(window.clip)
+            # Keep the row with empty metadata if ground truth is missing.
+            patient_id = ""
+            pulse = ""
+            hemoglobin = ""
+            ppg_file = ""
+            ppg_hr = ""
+            ppg_start = ""
+            ppg_end = ""
+            ppg_sampling_frequency = ""
+            if not data:
+                print(f"  [WARNING] No ground truth found: {window.clip}")
+            else:
+                patient_id, pulse, hemoglobin, ppg_file, ppg_data = data
+                if not ppg_data:
+                    print(f"  [WARNING] No PPG data: {window.clip}")
+                else:
+                    try:
+                        # Convert the segment's relative time to the PPG's absolute time.
+                        ppg_start = window.abs_start
+                        ppg_end = window.abs_start + window.t_end - window.t_start
+                        ppg_sampling_frequency = ppg_data.sampling_frequency
+                        ppg_hr, _ = spectral_hr(ppg_segment(ppg_data, ppg_start, ppg_end), ppg_sampling_frequency)
+                    except Exception as error:
+                        print(f"  [ERROR] Failed to calculate PPG HR: {window.segment}: {error}")
+            # Write window, ground-truth, and PPG metadata.
             writer.writerow([
                 window.segment,
                 window.clip,
@@ -115,10 +191,18 @@ def _write_manifest(windows: list[WindowInfo], output_dir: str) -> None:
                 window.t_start,
                 window.t_end,
                 window.abs_start,
+                patient_id,
+                pulse,
+                hemoglobin,
+                ppg_file,
+                ppg_hr,
+                ppg_start,
+                ppg_end,
+                ppg_sampling_frequency
             ])
 
 
-def process_dataset(task: DatasetTask) -> DatasetResult:
+def process_dataset_task(task: DatasetTask) -> DatasetResult:
     """
     Process a single extracted signal archive.
 
@@ -142,6 +226,9 @@ def process_dataset(task: DatasetTask) -> DatasetResult:
         signals = data["signals"]
         timestamps = data["timestamps"]
         pixel_counts = data["pixel_counts"]
+
+        # Resample timestamps for 3 minute video
+        timestamps = np.linspace(0, 180, len(timestamps), dtype=float)
 
         # A facial region is valid only when all three RGB channels are finite.
         valid_regions = np.isfinite(signals).all(axis=-1)
@@ -185,9 +272,12 @@ def process_dataset(task: DatasetTask) -> DatasetResult:
             # Interpolate quality metadata.
             resampled_pixel_counts = resample_pixel_counts(window_counts, window_times, output_times)
 
+            if window.region_mask is None:
+                raise ValueError(f"Region mask is missing for window '{window.segment}'.")
+
             # Mark rejected facial regions as unavailable.
             resampled_signals[:, ~window.region_mask] = np.nan
-            resampled_pixel_counts[:, ~window.region_mask] = np.nan
+            resampled_pixel_counts[:, ~window.region_mask] = 0.0
 
             # Save the generated dataset sample.
             np.savez_compressed(
@@ -229,6 +319,8 @@ def main() -> None:
         description=("Generate fixed-length training windows from extracted rPPG signals.")
     )
     ap.add_argument("--signals-dir", default="output/signals")
+    ap.add_argument("--ppg-dir", default="data/ppg")
+    ap.add_argument("--ground-truth", default="data/ground_truth.csv")
     ap.add_argument("--out-dir", default="output/dataset")
     ap.add_argument("--workers", type=int, default=0,
         help="Number of worker processes (0 = all available cores)."
@@ -270,7 +362,7 @@ def main() -> None:
     total_windows = 0
 
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(process_dataset, task): task.name for task in tasks}
+        futures = {pool.submit(process_dataset_task, task): task.name for task in tasks}
 
         # Report completed tasks as workers finish.
         for index, future in enumerate(as_completed(futures), 1):
@@ -280,7 +372,8 @@ def main() -> None:
             print(f"[{index}/{len(tasks)}] {result.log}")
 
     # Save dataset metadata.
-    _write_manifest(manifest, args.out_dir)
+    print("Generating manifest file...")
+    _write_manifest(manifest, args.out_dir, args.ppg_dir, args.ground_truth)
     print(f"\nGenerated {total_windows} dataset window(s)")
     print(f"Manifest -> {os.path.join(args.out_dir, 'segments_manifest.csv')}")
 
