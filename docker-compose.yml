@@ -105,7 +105,7 @@ services:
       - ./hb_model:/app/hb_model:ro
     command: ["python", "-m", "prediction.predict", "--dataset-dir", "/output/dataset", "--ppg-dir", "/data/ppg",
               "--manifest", "/output/dataset/segments_manifest.csv", "--out-dir", "/output/prediction",
-              "--hr-model", "/output/hr_model", "--hb-model", "/output/hb_model", "--workers", "8"]
+              "--hr-model", "/output/hr_model", "--hb-model", "/output/hb_model", "--no-plot", "--workers", "1"]
 
 #   docker compose run --rm segmentation
 #   docker compose run --rm landmarks

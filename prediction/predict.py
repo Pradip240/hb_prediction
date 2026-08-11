@@ -341,13 +341,12 @@ def main() -> None:
         )
 
     # Generate final aggregate plots.
-    if not args.no_plot:
-        accuracy_plot = write_accuracy_plot(rows, args.out_dir)
-        if accuracy_plot:
-            print(f"accuracy plot -> {accuracy_plot}")
-        hb_accuracy_plot = write_hb_accuracy_plot(rows, args.out_dir)
-        if hb_accuracy_plot:
-            print(f"Hb accuracy plot -> {hb_accuracy_plot}")
+    accuracy_plot = write_accuracy_plot(rows, args.out_dir)
+    if accuracy_plot:
+        print(f"accuracy plot -> {accuracy_plot}")
+    hb_accuracy_plot = write_hb_accuracy_plot(rows, args.out_dir)
+    if hb_accuracy_plot:
+        print(f"Hb accuracy plot -> {hb_accuracy_plot}")
 
 
 if __name__ == "__main__":
