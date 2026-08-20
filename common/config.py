@@ -1,4 +1,5 @@
-"""Configuration shared across the CPU processing pipeline.
+"""
+Configuration shared across the CPU processing pipeline.
 
 The parameters are grouped by processing stage:
 
@@ -14,7 +15,6 @@ The parameters are grouped by processing stage:
 
 # Fallback frame rate used when the input video does not provide one.
 DEFAULT_FPS: float = 30.0
-
 
 
 # ============================================================================
@@ -35,7 +35,6 @@ MASK_SMOOTH_ENABLED = True
 MASK_SMOOTH_THRESHOLD = 0.5
 
 
-
 # ============================================================================
 # Facial regions
 # ============================================================================
@@ -45,13 +44,45 @@ MASK_SMOOTH_THRESHOLD = 0.5
 FOREHEAD_POLY = [67, 109, 10, 338, 297, 299, 337, 151, 108, 69, 104, 9]
 
 LEFT_CHEEK_POLY = [
-    116, 117, 118, 119, 100, 142, 36, 205, 187, 123, 50, 101,
-    147, 213, 192, 214, 135, 138,
+    116,
+    117,
+    118,
+    119,
+    100,
+    142,
+    36,
+    205,
+    187,
+    123,
+    50,
+    101,
+    147,
+    213,
+    192,
+    214,
+    135,
+    138,
 ]
 
 RIGHT_CHEEK_POLY = [
-    345, 346, 347, 348, 329, 371, 266, 425, 411, 352, 280, 330,
-    376, 433, 416, 434, 364, 367,
+    345,
+    346,
+    347,
+    348,
+    329,
+    371,
+    266,
+    425,
+    411,
+    352,
+    280,
+    330,
+    376,
+    433,
+    416,
+    434,
+    364,
+    367,
 ]
 
 # Region definitions.
@@ -89,10 +120,9 @@ REGION_ORDER = ("forehead", "lcheek", "rcheek")
 SKIN_CLASS_IDS = (1,)
 
 # Region-mask construction.
-ROI_EROSION_PX = 3      # Erode region boundaries to reduce edge contamination.
-SUBPIX_SHIFT = 3        # Polygon rasterization precision (1 / 2^SUBPIX_SHIFT px).
-MIN_SKIN_PIXELS = 80    # Regions below this size are marked invalid.
-
+ROI_EROSION_PX = 3  # Erode region boundaries to reduce edge contamination.
+SUBPIX_SHIFT = 3  # Polygon rasterization precision (1 / 2^SUBPIX_SHIFT px).
+MIN_SKIN_PIXELS = 80  # Regions below this size are marked invalid.
 
 
 # ============================================================================
@@ -101,9 +131,9 @@ MIN_SKIN_PIXELS = 80    # Regions below this size are marked invalid.
 
 # Region colors in BGR order.
 REGION_COLORS = {
-    "forehead": (0, 255, 255),   # yellow
-    "lcheek": (255, 0, 255),     # magenta
-    "rcheek": (0, 255, 0),       # green
+    "forehead": (0, 255, 255),  # yellow
+    "lcheek": (255, 0, 255),  # magenta
+    "rcheek": (0, 255, 0),  # green
 }
 
 # Overlay transparency.
@@ -147,7 +177,6 @@ GAP_FACTOR = 2.0
 TARGET_FPS = 30
 
 
-
 # ============================================================================
 # Region weighting
 # ============================================================================
@@ -162,7 +191,6 @@ REGION_WEIGHT_ENABLED = True
 REGION_WEIGHT_SMOOTH_SEC = 1.0
 
 
-
 # ============================================================================
 # rPPG signal processing
 # ============================================================================
@@ -171,8 +199,8 @@ REGION_WEIGHT_SMOOTH_SEC = 1.0
 POS_WINDOW_SEC = 1.6
 
 # Physiological heart-rate frequency range used by rPPG algorithms (Hz).
-HR_FREQ_MIN_HZ = 0.9     # ~54 BPM
-HR_FREQ_MAX_HZ = 2.8     # ~168 BPM
+HR_FREQ_MIN_HZ = 0.9  # ~54 BPM
+HR_FREQ_MAX_HZ = 2.8  # ~168 BPM
 
 # Order of the Butterworth bandpass filter used by CHROM and other signal-processing methods.
 BANDPASS_ORDER = 3

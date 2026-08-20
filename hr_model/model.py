@@ -12,7 +12,8 @@ Processing pipeline:
 4. Use a 1-D CNN across frequency to learn which spectral peaks are
    associated with cardiac activity.
 5. Apply a softmax over the HR-frequency bins.
-6. Compute a differentiable soft-argmax to obtain a continuous HR estimate.
+6. Compute a differentiable local soft-argmax around the dominant peak to
+   obtain a continuous HR estimate.
 
 The training objective combines:
 - Smooth-L1 regression loss on the predicted heart rate.
@@ -20,8 +21,9 @@ The training objective combines:
   ground-truth heart rate.
 
 The Gaussian target encourages the predicted spectral distribution to
-concentrate around the true heart rate while the soft-argmax provides a
-continuous BPM prediction.
+concentrate around the true heart rate while the local soft-argmax provides a
+continuous BPM prediction that commits to a single spectral peak rather than
+averaging across competing peaks.
 """
 
 import numpy as np
@@ -41,6 +43,7 @@ class HRSpectralNet(nn.Module):
         hr_min: float = 40.0,
         hr_max: float = 200.0,
         width: int = 64,
+        readout_halfwidth_bpm: float = 12.0,
     ) -> None:
         """
         Initialize the spectral HR model.
@@ -52,6 +55,8 @@ class HRSpectralNet(nn.Module):
             hr_min: Lower HR limit represented by the output spectrum in BPM.
             hr_max: Upper HR limit represented by the output spectrum in BPM.
             width: Number of feature channels used by the convolutional network.
+            readout_halfwidth_bpm: Half-width in BPM of the window used by the
+                local soft-argmax readout around the dominant spectral peak.
         """
         super().__init__()
 
@@ -63,10 +68,13 @@ class HRSpectralNet(nn.Module):
             raise ValueError("nfft must be at least 2.")
         if hr_min >= hr_max:
             raise ValueError("hr_min must be smaller than hr_max.")
+        if readout_halfwidth_bpm <= 0:
+            raise ValueError("readout_halfwidth_bpm must be positive.")
 
         self.n_channels = n_channels
         self.fps = float(fps)
         self.nfft = int(nfft)
+        self.readout_halfwidth_bpm = float(readout_halfwidth_bpm)
 
         # Build the FFT frequency grid and keep only the configured HR band.
         frequencies = np.fft.rfftfreq(self.nfft, d=1.0 / self.fps)
@@ -133,6 +141,40 @@ class HRSpectralNet(nn.Module):
         power = power / (power.std(dim=-1, keepdim=True) + 1e-6)
         return power
 
+    def local_soft_argmax(self, probability: Tensor) -> Tensor:
+        """
+        Estimate a continuous HR by soft-argmax around the dominant peak.
+
+        A global soft-argmax computes the expectation over the entire HR band.
+        When the spectral distribution is multi-modal, for example when a strong
+        sub-harmonic competes with the true pulse peak, that expectation falls in
+        the empty valley between the peaks and is wrong for both. Restricting the
+        expectation to a narrow window around the highest-probability bin lets the
+        readout commit to a single peak while remaining differentiable.
+
+        Args:
+            probability: Spectral probabilities with shape (B, F).
+
+        Returns:
+            Predicted HR in BPM with shape (B,).
+        """
+        # Locate the dominant HR bin for every sample.
+        peak_index = torch.argmax(probability, dim=-1)
+        peak_bpm = self.band_bpm[peak_index]  # type: ignore
+
+        # Build a soft window around each peak so bins far from the peak do not
+        # contribute to the expectation.
+        distance = (self.band_bpm[None, :] - peak_bpm[:, None]).abs()  # type: ignore
+        window = (distance <= self.readout_halfwidth_bpm).to(probability.dtype) # type: ignore
+
+        # Re-weight the probabilities by the window and renormalize.
+        windowed = probability * window # type: ignore
+        windowed = windowed / (windowed.sum(dim=-1, keepdim=True) + 1e-9) # type: ignore
+
+        # Differentiable expectation restricted to the local window.
+        predicted_bpm = (windowed * self.band_bpm).sum(dim=-1)  # type: ignore
+        return predicted_bpm # type: ignore
+
     def forward(self, signal: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """
         Predict heart rate and its spectral probability distribution.
@@ -154,8 +196,8 @@ class HRSpectralNet(nn.Module):
         # Convert spectral scores into a probability distribution.
         probability = torch.softmax(logits, dim=-1)
 
-        # Differentiable soft-argmax over the HR spectrum.
-        predicted_bpm = (probability * self.band_bpm).sum(dim=-1)  # type: ignore
+        # Differentiable local soft-argmax around the dominant spectral peak.
+        predicted_bpm = self.local_soft_argmax(probability)
         return predicted_bpm, logits, probability  # type: ignore
 
     def gaussian_target(self, heart_rate: Tensor, sigma_bpm: float = 4.0) -> Tensor:
@@ -181,12 +223,18 @@ class HRSpectralNet(nn.Module):
         predicted_bpm: Tensor,
         logits: Tensor,
         true_bpm: Tensor,
-        l1_weight: float = 1.0,
-        ce_weight: float = 0.3,
+        l1_weight: float = 0.2,
+        ce_weight: float = 1.0,
         sigma_bpm: float = 4.0,
     ) -> tuple[Tensor, dict[str, float]]:
         """
         Compute the combined HR regression and spectral-distribution loss.
+
+        The soft cross-entropy term shapes the spectral distribution into a
+        single sharp peak at the true HR and carries the majority of the
+        gradient. The Smooth-L1 term refines the continuous readout and is
+        weighted lightly so it does not pull probability mass into the region
+        between competing peaks in order to move the distribution mean.
 
         Args:
             predicted_bpm: Model HR predictions with shape (B,).
