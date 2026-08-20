@@ -1,6 +1,8 @@
 import re
-import numpy as np
+
 import matplotlib
+import numpy as np
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -65,7 +67,7 @@ def plot_segment(
     elif task.hr_true is not None:
         text = f"HR ground truth (from CSV): {task.hr_true:.0f} BPM"
         axes[3].text(
-            0.5, 0.5, text, ha="center", va="center", transform=axes[3].transAxes, 
+            0.5, 0.5, text, ha="center", va="center", transform=axes[3].transAxes,
             fontsize=12, fontweight="bold", color="crimson"
         )
         axes[3].set_ylabel("HR label\n(pulse)")
@@ -151,17 +153,17 @@ def write_accuracy_plot(rows: list[dict[str, str]], out_dir: str) -> str | None:
         panels.append(("model", "hr_pred", "hr_pred_conf"))
 
     finite_labels = lab[np.isfinite(lab)]
-    limits = [
+    limits: list[float] = [
         max(30, np.floor(finite_labels.min() / 10) * 10 - 5),
         np.ceil(finite_labels.max() / 10) * 10 + 5
     ]
     n_panels = len(panels)
-    fig, axes = plt.subplots(1, n_panels, figsize=(5.3 * n_panels, 5.4))
+    fig, axes = plt.subplots(1, n_panels, figsize=(5.3 * n_panels, 5.4)) # type: ignore
 
     if n_panels == 1:
         axes = [axes]
     for axis, (name, hr_column, confidence_column) in zip(axes, panels):
-        hr = np.array([float(row.get(hr_column)) for row in rows])
+        hr = np.array([float(row.get(hr_column)) if row.get(hr_column) else np.nan for row in rows])
         valid = np.isfinite(hr) & np.isfinite(lab)
         if valid.sum() == 0:
             axis.set_title(f"{name}: no scorable segments")
@@ -204,7 +206,7 @@ def write_accuracy_plot(rows: list[dict[str, str]], out_dir: str) -> str | None:
                 )
 
         axis.set_title(f"{name}\nMAE {mae:.1f}, bias {bias:+.1f}, w6 {within_6:.0f}%{extra}", fontsize=10)
-        axis.set_xlabel("PPG label HR (BPM)")
+        axis.set_xlabel("GT label HR (BPM)")
         axis.set_xlim(limits)
         axis.set_ylim(limits)
         axis.grid(alpha=0.3)
@@ -212,7 +214,7 @@ def write_accuracy_plot(rows: list[dict[str, str]], out_dir: str) -> str | None:
 
     axes[0].set_ylabel("predicted HR (BPM)")
     fig.suptitle(
-        f"HR accuracy vs PPG label — {int(np.isfinite(lab).sum())} labeled segments"
+        f"HR accuracy on GT label — {int(np.isfinite(lab).sum())} labeled segments"
         + "  (incl. trained model)" if has_model else "",
         fontweight="bold"
     )
@@ -248,7 +250,7 @@ def write_hb_accuracy_plot(rows: list[dict[str, str]], out_dir: str) -> str | No
 
     # Aggregate segment predictions by subject.
     subjects = np.array([
-        (   
+        (
             re.match(r"(\d+)", row.get("clip", "") or row.get("segment", "")).group(1)
             if re.match(r"(\d+)", row.get("clip", "") or row.get("segment", "")) else "?"
         )
@@ -302,7 +304,7 @@ def write_hb_accuracy_plot(rows: list[dict[str, str]], out_dir: str) -> str | No
     axes[0].axhline(mean_hb_segment, color="gray", ls=":", lw=1.2, label=f"naive=mean Hb ({mean_hb_segment:.1f})")
     axes[0].set_xlabel("true Hb (g/dL)")
     axes[0].set_ylabel("predicted Hb (g/dL)")
-    verdict_segment = "BEATS naive" if segment_mae < naive_segment_mae else "WORSE than naive" 
+    verdict_segment = "BEATS naive" if segment_mae < naive_segment_mae else "WORSE than naive"
     axes[0].set_title(
         f"per-segment\n"
         f"model MAE {segment_mae:.2f}  |  "

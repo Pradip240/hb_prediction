@@ -1,4 +1,5 @@
-"""Shared signal-processing utilities for the CPU pipeline.
+"""
+Shared signal-processing utilities for the CPU pipeline.
 
 The module is divided into three stages:
 
@@ -21,16 +22,14 @@ downstream HR processing so that all stages operate on consistent region
 definitions and signal-processing logic.
 """
 
-
 import cv2
 import numpy as np
 from cv2.typing import MatLike
 from numpy.typing import NDArray
-from scipy.signal import butter, filtfilt # type: ignore
+from scipy.signal import butter, filtfilt  # type: ignore
 
 from common import config
 from common.one_euro import OneEuroFilter
-
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +163,7 @@ def build_region_masks(
     shape_hw: tuple[int, int],
     landmarks_xy: NDArray[np.float64],
     skin_masks: NDArray[np.uint8],
-    kernel: NDArray[np.uint8] | None
+    kernel: NDArray[np.uint8] | None,
 ) -> NDArray[np.uint8]:
     """
     Construct skin-constrained masks for all facial regions across a frames.
@@ -195,7 +194,6 @@ def build_region_masks(
         if kernel is not None:
             region_masks[region_idx] = cv2.erode(region, kernel, iterations=1)
     return region_masks
-
 
 
 # ---------------------------------------------------------------------------
@@ -267,14 +265,13 @@ def combine_regions(signals: np.ndarray, pixel_counts: np.ndarray, fps: float) -
         kernel = np.ones(window) / window
         pixel_counts = np.stack(
             [np.convolve(pixel_counts[:, region], kernel, mode="same") for region in range(pixel_counts.shape[1])],
-            axis=1
+            axis=1,
         )
 
     # Compute the weighted RGB mean independently for each frame.
     weighted_sum = np.nansum(np.where(np.isfinite(signals), signals, 0.0) * pixel_counts[:, :, None], axis=1)
     weight_sum = pixel_counts.sum(axis=1)
     return weighted_sum / weight_sum[:, None]
-
 
 
 # ---------------------------------------------------------------------------
@@ -348,12 +345,12 @@ def bandpass_filter(signal: np.ndarray, fps: float, apply_detrend: bool = True) 
         return processed_signal
 
     # Design a Butterworth bandpass filter for the physiological pulse band.
-    numerator, denominator = butter( # type: ignore
+    numerator, denominator = butter(  # type: ignore
         config.BANDPASS_ORDER, [low_normalized, high_normalized], btype="band", output="ba"
     )
 
     # filtfilt requires enough samples for the filter's edge padding.
-    minimum_samples = 3 * max(len(numerator), len(denominator)) # type: ignore
+    minimum_samples = 3 * max(len(numerator), len(denominator))  # type: ignore
     if len(processed_signal) <= minimum_samples:
         return processed_signal
 

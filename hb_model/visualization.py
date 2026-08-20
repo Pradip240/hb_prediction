@@ -1,4 +1,5 @@
-"""Visualization utilities for hemoglobin model training.
+"""
+Visualization utilities for hemoglobin model training.
 
 This module creates diagnostic plots from the training history and final
 test metrics of the HbMLP regression model.
@@ -17,6 +18,7 @@ they can be generated inside a training container without a display server.
 import os
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -53,7 +55,7 @@ def plot_history(history: list[dict[str, float]], test_mae: float, test_rmse: fl
     plt.grid(alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(loss_path,dpi=130)
+    plt.savefig(loss_path, dpi=130)
     plt.close()
     print(f"training plot: {loss_path}")
 

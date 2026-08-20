@@ -1,4 +1,5 @@
-"""Spectral CNN for heart-rate estimation from facial RGB signals.
+"""
+Spectral CNN for heart-rate estimation from facial RGB signals.
 
 HRSpectralNet estimates heart rate directly from the frequency-domain
 representation of per-region RGB signals.
@@ -30,9 +31,7 @@ from torch import Tensor
 
 
 class HRSpectralNet(nn.Module):
-    """
-    Estimate heart rate from multi-channel facial RGB signals.
-    """
+    """Estimate heart rate from multi-channel facial RGB signals."""
 
     def __init__(
         self,
@@ -41,7 +40,7 @@ class HRSpectralNet(nn.Module):
         nfft: int = 2048,
         hr_min: float = 40.0,
         hr_max: float = 200.0,
-        width: int = 64
+        width: int = 64,
     ) -> None:
         """
         Initialize the spectral HR model.
@@ -89,18 +88,14 @@ class HRSpectralNet(nn.Module):
             nn.Conv1d(n_channels, width, kernel_size=5, padding=2),
             nn.BatchNorm1d(width),
             nn.GELU(),
-
             nn.Conv1d(width, width, kernel_size=5, padding=2),
             nn.BatchNorm1d(width),
             nn.GELU(),
-
             nn.Conv1d(width, width, kernel_size=5, padding=2),
             nn.BatchNorm1d(width),
             nn.GELU(),
-
             nn.Conv1d(width, 1, kernel_size=1),
         )
-
 
     def spectral_input(self, signal: Tensor) -> Tensor:
         """
@@ -122,22 +117,21 @@ class HRSpectralNet(nn.Module):
         window = torch.hann_window(signal.shape[-1], device=signal.device, dtype=signal.dtype)
         windowed_signal = signal * window
         # Convert each channel from time domain to frequency domain.
-        spectrum = torch.fft.rfft(windowed_signal, n=self.nfft, dim=-1) # type: ignore
+        spectrum = torch.fft.rfft(windowed_signal, n=self.nfft, dim=-1)  # type: ignore
 
         # Compute power spectrum.
-        power = spectrum.real.square() + spectrum.imag.square() # type: ignore
+        power = spectrum.real.square() + spectrum.imag.square()  # type: ignore
 
         # Keep only frequencies within the configured HR band.
-        power = power.index_select(-1, self.band_idx) # type: ignore
+        power = power.index_select(-1, self.band_idx)  # type: ignore
 
         # Compress the dynamic range of spectral power.
-        power = torch.log1p(power) # type: ignore
+        power = torch.log1p(power)  # type: ignore
 
         # Normalize each channel independently across frequency.
         power = power - power.mean(dim=-1, keepdim=True)
         power = power / (power.std(dim=-1, keepdim=True) + 1e-6)
         return power
-
 
     def forward(self, signal: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """
@@ -161,9 +155,8 @@ class HRSpectralNet(nn.Module):
         probability = torch.softmax(logits, dim=-1)
 
         # Differentiable soft-argmax over the HR spectrum.
-        predicted_bpm = (probability * self.band_bpm).sum(dim=-1) # type: ignore
-        return predicted_bpm, logits, probability # type: ignore
-
+        predicted_bpm = (probability * self.band_bpm).sum(dim=-1)  # type: ignore
+        return predicted_bpm, logits, probability  # type: ignore
 
     def gaussian_target(self, heart_rate: Tensor, sigma_bpm: float = 4.0) -> Tensor:
         """
@@ -179,10 +172,9 @@ class HRSpectralNet(nn.Module):
         if sigma_bpm <= 0:
             raise ValueError("sigma_bpm must be positive.")
 
-        distance = (self.band_bpm[None, :] - heart_rate[:, None]) / sigma_bpm # type: ignore
-        target = torch.exp(-0.5 * distance.square()) # type: ignore
+        distance = (self.band_bpm[None, :] - heart_rate[:, None]) / sigma_bpm  # type: ignore
+        target = torch.exp(-0.5 * distance.square())  # type: ignore
         return target / (target.sum(dim=-1, keepdim=True) + 1e-9)
-
 
     def loss(
         self,
@@ -213,7 +205,7 @@ class HRSpectralNet(nn.Module):
         target = self.gaussian_target(true_bpm, sigma_bpm=sigma_bpm)
         log_probability = torch.log_softmax(logits, dim=-1)
         soft_ce = -(target * log_probability).sum(dim=-1).mean()
-        total_loss = (l1_weight * smooth_l1 + ce_weight * soft_ce)
+        total_loss = l1_weight * smooth_l1 + ce_weight * soft_ce
 
         return total_loss, {
             "smooth_l1": float(smooth_l1.detach().item()),

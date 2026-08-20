@@ -1,27 +1,22 @@
-"""
-Data models shared across the rPPG processing pipeline.
-"""
+"""Data models shared across the rPPG processing pipeline."""
 
-from enum import StrEnum
 from dataclasses import dataclass
+from enum import StrEnum
 
 import numpy as np
-
 
 VIDEO_EXTENSIONS = (".mkv", ".mp4", ".avi", ".mov")
 
 
 class FileExtension(StrEnum):
-    """
-    Pipeline output file suffixes.
-    """
+    """Pipeline output file suffixes."""
+
     SEGMENTATION = "_seg.npz"
     LANDMARKS = "_landmarks.npz"
     SIGNAL_PLOT = "_signals.png"
     VIDEO_OVERLAY = "_overlay.mp4"
     SIGNALS = "_signals.npz"
     DATASET_SAMPLE = "_sample.npz"
-
 
 
 # ============================================================================
@@ -44,6 +39,7 @@ class ClipTask:
         no_video: Whether overlay generation is disabled.
         overwrite: Whether existing outputs should be recomputed.
     """
+
     name: str
     video_path: str
     segmentation_path: str
@@ -66,10 +62,10 @@ class ClipResult:
         log: Processing summary suitable for console output.
         success: True if processing completed successfully, otherwise False.
     """
+
     name: str
     log: str
     success: bool
-
 
 
 # ============================================================================
@@ -85,6 +81,7 @@ class DatasetTask:
         signal_path: Path to the extracted signal archive.
         output_dir: Directory where dataset windows are written.
     """
+
     name: str
     signal_path: str
     output_dir: str
@@ -99,6 +96,7 @@ class BrokenInterval:
         start: Start time of the broken interval relative to the window.
         end: End time of the broken interval relative to the window.
     """
+
     start: float
     end: float
 
@@ -117,6 +115,7 @@ class WindowInfo:
         abs_start: Absolute timestamp of the window start.
         region_mask: Optional Boolean mask indicating valid facial regions.
     """
+
     segment: str
     clip: str
     index: int
@@ -138,12 +137,12 @@ class DatasetResult:
         count: Number of generated windows.
         success: True if processing completed successfully.
     """
+
     name: str
     log: str
     windows: list[WindowInfo]
     count: int
     success: bool
-
 
 
 # ============================================================================
@@ -159,6 +158,7 @@ class PPGSignal:
         sampling_frequency: Sampling frequency in Hz.
         start_timestamp: Absolute start timestamp in seconds.
     """
+
     samples: np.ndarray
     sampling_frequency: float
     start_timestamp: float
@@ -181,6 +181,7 @@ class PredictionTask:
         hr_model: Path to the trained HR model.
         hb_model: Path to the trained Hb model.
     """
+
     name: str
     sample_path: str
     segment: WindowInfo
@@ -191,7 +192,6 @@ class PredictionTask:
     hb_true: float | None
     hr_model: str | None
     hb_model: str | None
-    
 
 
 @dataclass(slots=True, frozen=True)
@@ -216,6 +216,7 @@ class PredictionRecord:
         hb_label: Ground-truth hemoglobin value.
         hb_pred: Trained hemoglobin model prediction.
     """
+
     segment: str
     clip: str
     t_start: float
@@ -244,6 +245,7 @@ class PredictionResult:
         success: True if processing completed successfully, otherwise False.
         error: Error message when processing fails.
     """
+
     name: str
     prediction: PredictionRecord | None
     success: bool
@@ -260,6 +262,7 @@ class WaveformResult:
         heart_rate: Estimated heart rate in BPM.
         confidence: Confidence of the heart-rate estimate.
     """
+
     waveform: np.ndarray
     heart_rate: float | None
     confidence: float

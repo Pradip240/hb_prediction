@@ -1,4 +1,5 @@
-"""MLP regression model for hemoglobin estimation.
+"""
+MLP regression model for hemoglobin estimation.
 
 HbMLP predicts hemoglobin concentration from a low-dimensional feature
 vector extracted from facial signals.
@@ -19,7 +20,8 @@ from torch import Tensor
 
 
 class HbMLP(nn.Module):
-    """Small multilayer perceptron for hemoglobin regression.
+    """
+    Small multilayer perceptron for hemoglobin regression.
 
     Args:
         n_in: Number of input features.
@@ -31,6 +33,14 @@ class HbMLP(nn.Module):
     """
 
     def __init__(self, n_in: int, width: int = 512, dropout: float = 0.3) -> None:
+        """
+        Initialize the feed-forward regression network.
+
+        Args:
+            n_in: Number of input features.
+            width: Number of units in the first hidden layer.
+            dropout: Dropout probability applied after each hidden activation.
+        """
         super().__init__()
 
         self.net = nn.Sequential(
@@ -38,22 +48,20 @@ class HbMLP(nn.Module):
             nn.BatchNorm1d(width),
             nn.GELU(),
             nn.Dropout(dropout),
-
             nn.Linear(width, width // 2),
             nn.BatchNorm1d(width // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            
             nn.Linear(width // 2, width // 4),
             nn.BatchNorm1d(width // 4),
             nn.GELU(),
             nn.Dropout(dropout),
-
             nn.Linear(width // 4, 1),
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        """Predict hemoglobin for a batch of feature vectors.
+        """
+        Predict hemoglobin for a batch of feature vectors.
 
         Args:
             x: Input feature tensor with shape (B, n_in).

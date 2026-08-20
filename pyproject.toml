@@ -1,0 +1,17 @@
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+# Enable standard Ruff rules (E, F) AND pydocstyle rules (D)
+select = ["E", "F", "D", "W", "I", "ANN"]
+# Ignore D100 (module docstrings) and D104 (package/folder docstrings)
+ignore = ["D100", "D104", "D212", "ANN401"]
+extend-select = ["D213"]
+
+[tool.ruff.lint.pydocstyle]
+# Tell Ruff to enforce the Google docstring style
+convention = "google"
+
+[tool.ruff.lint.isort]
+# Tells Ruff these folders are your local code, not downloaded packages
+known-first-party = ["db", "middleware", "schemas", "services", "utils", "shared"]

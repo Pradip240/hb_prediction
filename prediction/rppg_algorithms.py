@@ -1,4 +1,5 @@
-"""Classical rPPG algorithms for facial RGB signals.
+"""
+Classical rPPG algorithms for facial RGB signals.
 
 This module provides the rPPG methods used to extract pulse waveforms and
 estimate heart rate from combined facial RGB signals:
@@ -15,8 +16,8 @@ bandpass filtering, and spectral heart-rate estimation are provided by
 
 import numpy as np
 
-from common import config
 import common.signal_processing as sp
+from common import config
 from common.data_types import WaveformResult
 
 
@@ -35,7 +36,7 @@ def extract_pos(rgb_signal: np.ndarray, fps: float) -> np.ndarray:
     pulse = np.zeros(n_samples)
 
     # Use the configured temporal window for the POS calculation.
-    window_size = int(round(config.POS_WINDOW_SEC * fps))
+    window_size = round(config.POS_WINDOW_SEC * fps)
 
     # POS projection matrix for the normalized RGB signal.
     projection = np.array([
@@ -45,7 +46,7 @@ def extract_pos(rgb_signal: np.ndarray, fps: float) -> np.ndarray:
 
     # Accumulate the POS waveform produced by each sliding window.
     if (window_size >= 2) and (n_samples >= window_size):
-        for start in range(0, n_samples - window_size + 1):
+        for start in range(n_samples - window_size + 1):
             window = rgb_signal[start:start + window_size]
             # Normalize RGB values by the mean color of the current window.
             mean_rgb = np.mean(window, axis=0) + 1e-9
@@ -60,7 +61,7 @@ def extract_pos(rgb_signal: np.ndarray, fps: float) -> np.ndarray:
             pulse[start:start + window_size] += (
                 window_pulse - np.mean(window_pulse)
             )
-    return pulse
+    return sp.bandpass_filter(pulse, fps=fps, apply_detrend=True)
 
 
 def extract_chrom(rgb_signal: np.ndarray, fps: float) -> np.ndarray:

@@ -7,7 +7,7 @@ gap rejection, or file I/O.
 """
 
 import numpy as np
-from scipy.interpolate import PchipInterpolator # type: ignore
+from scipy.interpolate import PchipInterpolator  # type: ignore
 
 
 def collapse_duplicate_samples(timestamps: np.ndarray, samples: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

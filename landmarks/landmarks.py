@@ -36,12 +36,12 @@ coordinates and z is MediaPipe's relative depth estimate. Frames with no
 detected face are filled with NaN values.
 """
 
-import os
 import argparse
+import os
 
 import cv2
-import numpy as np
 import mediapipe as mp  # type: ignore
+import numpy as np
 
 VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".mov")
 MODEL_PATH = "face_landmarker.task"
@@ -91,11 +91,11 @@ def resolve_device(requested: str) -> tuple[mp.tasks.BaseOptions.Delegate, str]:
     if requested == "cpu":
         return delegate.CPU, "cpu"  # type: ignore
     try:
-        probe = mp.tasks.vision.FaceLandmarker.create_from_options(make_options(delegate.GPU)) # type: ignore
+        probe = mp.tasks.vision.FaceLandmarker.create_from_options(make_options(delegate.GPU))  # type: ignore
         probe.detect_for_video(  # type: ignore
             mp.Image(image_format=mp.ImageFormat.SRGB, data=np.zeros((64, 64, 3), np.uint8)), 0
         )
-        probe.close() # type: ignore
+        probe.close()  # type: ignore
         return delegate.GPU, "gpu"  # type: ignore
     except Exception as exc:
         print(f"GPU device unavailable ({type(exc).__name__}: {exc}); falling back to CPU.")
@@ -103,13 +103,9 @@ def resolve_device(requested: str) -> tuple[mp.tasks.BaseOptions.Delegate, str]:
 
 
 def main() -> None:
-    """
-    Process all input videos and save per-frame face landmarks as .npz files.
-    """
+    """Process all input videos and save per-frame face landmarks as .npz files."""
     # Parse arguments
-    ap = argparse.ArgumentParser(
-        description="Save per-frame MediaPipe face landmarks as .npz."
-    )
+    ap = argparse.ArgumentParser(description="Save per-frame MediaPipe face landmarks as .npz.")
     ap.add_argument("--input-dir", default="videos")
     ap.add_argument("--output-dir", default="landmarks")
     ap.add_argument("--device", default="gpu", help="'gpu' or 'cpu' (auto if omitted)")
@@ -145,7 +141,7 @@ def main() -> None:
 
         # Extract landmarks
         frames: list[np.ndarray] = []
-        with mp.tasks.vision.FaceLandmarker.create_from_options(make_options(delegate_enum)) as landmarker: # type: ignore
+        with mp.tasks.vision.FaceLandmarker.create_from_options(make_options(delegate_enum)) as landmarker:  # type: ignore
             frame_idx = 0
             # Read frames
             while True:
@@ -159,10 +155,10 @@ def main() -> None:
                 result = landmarker.detect_for_video(  # type: ignore
                     mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), ts_ms
                 )
-                if result.face_landmarks: # type: ignore
+                if result.face_landmarks:  # type: ignore
                     pts = np.array(
-                        [[lm.x * width, lm.y * height, lm.z] for lm in result.face_landmarks[0]], # type: ignore
-                        dtype=np.float32
+                        [[lm.x * width, lm.y * height, lm.z] for lm in result.face_landmarks[0]],  # type: ignore
+                        dtype=np.float32,
                     )
                 else:
                     pts = np.full((N_LANDMARKS, 3), np.nan, dtype=np.float32)
@@ -170,7 +166,7 @@ def main() -> None:
         cap.release()
 
         # Save landmark array
-        arr: np.ndarray = (np.stack(frames, axis=0) if frames else np.empty((0, N_LANDMARKS, 3), dtype=np.float32))
+        arr: np.ndarray = np.stack(frames, axis=0) if frames else np.empty((0, N_LANDMARKS, 3), dtype=np.float32)
         np.savez_compressed(out, landmarks=arr)
         print(f"[{i}/{len(videos)}] {name}: {arr.shape} -> {out}")
 

@@ -1,4 +1,5 @@
-"""Dataset for training the spectral heart-rate model.
+"""
+Dataset for training the spectral heart-rate model.
 
 The prepared segment archives contain:
 - signals: RGB signals with shape (T, R, 3).
@@ -16,11 +17,11 @@ The heart-rate target uses the PPG-derived heart rate when available,
 falling back to the ground-truth pulse value otherwise.
 """
 
-import os
 import csv
+import os
 
-import torch
 import numpy as np
+import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 
@@ -53,6 +54,18 @@ class SpectralDataset(Dataset[tuple[Tensor, Tensor]]):
     """
 
     def __init__(self, segments_dir: str, manifest: str, min_bpm: float, max_bpm: float) -> None:
+        """
+        Initialize the dataset from a segment manifest.
+
+        Args:
+            segments_dir: Directory containing the dataset segment files.
+            manifest: Path to the CSV manifest containing segment and heart-rate information.
+            min_bpm: Minimum inclusive heart-rate value to include, in BPM.
+            max_bpm: Maximum inclusive heart-rate value to include, in BPM.
+
+        Raises:
+            FileNotFoundError: If the manifest file does not exist.
+        """
         super().__init__()
 
         self.segments_dir = segments_dir
@@ -67,7 +80,7 @@ class SpectralDataset(Dataset[tuple[Tensor, Tensor]]):
         # Load segment paths and heart-rate targets from the manifest.
         with open(self.manifest, encoding="utf-8-sig", newline="") as file:
             for row in csv.DictReader(file):
-                segment = os.path.join(segments_dir, f'{row["segment"]}{FileExtension.DATASET_SAMPLE}')
+                segment = os.path.join(segments_dir, f"{row['segment']}{FileExtension.DATASET_SAMPLE}")
                 # Prefer the PPG-derived HR when available.
                 heart_rate = row["ppg_hr"] or row["pulse"]
                 if not heart_rate:
@@ -79,13 +92,9 @@ class SpectralDataset(Dataset[tuple[Tensor, Tensor]]):
                     continue
                 self.samples.append((segment, heart_rate))
 
-
     def __len__(self) -> int:
-        """
-        Return the number of valid training samples.
-        """
+        """Return the number of valid training samples."""
         return len(self.samples)
-
 
     @staticmethod
     def prepare_signal(path: str) -> Tensor:
@@ -133,8 +142,7 @@ class SpectralDataset(Dataset[tuple[Tensor, Tensor]]):
         mean = np.mean(features, axis=1, keepdims=True)
         std = np.std(features, axis=1, keepdims=True)
         features = (features - mean) / (std + 1e-6)
-        return torch.from_numpy(features) # type: ignore
-
+        return torch.from_numpy(features)  # type: ignore
 
     def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
         """
@@ -172,5 +180,5 @@ def load_dataset(segments_dir: str, manifest: str) -> SpectralDataset:
         segments_dir=segments_dir,
         manifest=manifest,
         min_bpm=config.HR_FREQ_MIN_HZ * 60.0,
-        max_bpm=config.HR_FREQ_MAX_HZ * 60.0
+        max_bpm=config.HR_FREQ_MAX_HZ * 60.0,
     )

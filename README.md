@@ -21,7 +21,6 @@ stage runs as a one-shot Docker Compose service.
 - [Build the images](#build-the-images)
 - [Prepare your data](#prepare-your-data)
 - [Running the pipeline](#running-the-pipeline)
-- [Custom dataset vs MCD dataset](#custom-dataset-vs-mcd-dataset)
 - [Outputs](#outputs)
 - [Data formats](#data-formats)
 - [How timing is handled](#how-timing-is-handled)
@@ -38,28 +37,28 @@ frame: `segmentation` produces a per-pixel skin/face parse, and `landmarks` prod
 face-mesh landmarks. Their outputs are cached as `.npz` files. This is the slow part; it
 runs once per dataset.
 
-**Phase 2 — signal analysis (CPU, fast, re-runnable).** Everything after reads the cached
+**Phase 2 — signal analysis and modelling (CPU/GPU).** Everything after reads the cached
 `.npz` instead of the video models:
 
 1. `signal_analysis` combines each video frame with its mask + landmarks to extract the
    per-region skin-colour time series (the rPPG signal), on a true time axis.
-2. `prepare_dataset` cuts that signal into clean, uniform 20-second segments suitable for
-   modelling.
-3. `hr_training` / `hb_training` train the HR and Hb models on those segments.
-4. `prediction` runs the DSP HR baseline and both trained models over the segments and
-   produces results tables and plots.
+2. `prepare_dataset` cuts that signal into clean, uniform 20-second windows suitable for
+   modelling and resamples them to a fixed rate.
+3. `hr_model` / `hb_model` train the HR and Hb models on those windows.
+4. `prediction` runs the DSP HR baselines and both trained models over the windows and
+   produces a results table and plots.
 
 ```
- data/videos ---+--> segmentation --> output/seg/*.npz --------+   Phase 1 (GPU)
-                +--> landmarks    --> output/landmarks/*.npz ---+
-                                                                v
-                                    signal_analysis --> output/signals/*.npz     (rPPG signal)
-                                                                v
-                                    prepare_dataset --> output/train_data/*.npz  (20 s segments)
-                          +-------------------------------------+---------------------------+
-                          v                                     v                           v
-                    hr_training                           hb_training                  prediction
-                output/hr_model/                      output/hb_model/           output/prediction/
+data/videos ---+--> segmentation --> output/seg/*.npz --------+   Phase 1 (GPU)
+               +--> landmarks    --> output/landmarks/*.npz ---+
+                                                               v
+                              signal_analysis --> output/signals/*.npz          (rPPG signal)
+                                                               v
+                              prepare_dataset --> output/dataset/*.npz           (20 s windows)
+                    +------------------------------------------+-----------------------------+
+                    v                                          v                             v
+              hr_model.train                            hb_model.train                  prediction
+             output/hr_model/                          output/hb_model/           output/prediction/
 ```
 
 ---
@@ -67,17 +66,23 @@ runs once per dataset.
 ## Repository layout
 
 ```
-rppg-pipeline/
-|-- docker-compose.yml          # runs every stage (one service each)
+hb_prediction/
+|-- docker-compose.yml          # runs each stage as a one-shot service
+|-- .gitignore
 |
 |-- docker/                     # the shared base image (rppg-base)
-|   |-- Dockerfile
+|   |-- Dockerfile              #   PyTorch CUDA runtime + ffmpeg
 |   `-- requirements.txt
 |
-|-- common/                     # shared code, imported as a package: from common import ...
+|-- common/                     # shared code, imported as a package (from common import config, ...)
 |   |-- __init__.py
-|   |-- config.py               #   ROI definitions, DSP frequency band, thresholds
-|   `-- signal_processing.py    #   region extraction + rPPG DSP (POS/CHROM, bandpass, ...)
+|   |-- config.py               #   ROI polygons, DSP frequency band, window/timing thresholds
+|   |-- data_types.py           #   dataclasses shared across stages (tasks, records, ...)
+|   |-- signal_processing.py    #   region extraction + rPPG DSP (POS / CHROM / green, bandpass)
+|   |-- one_euro.py             #   One-Euro smoothing filter (landmarks / masks)
+|   |-- ppg.py                  #   contact-PPG (.PW) parsing and HR labelling
+|   |-- video_utils.py          #   frame reading with real per-frame timestamps
+|   `-- visualize.py            #   shared plotting helpers
 |
 |-- segmentation/               # GPU . video -> skin/face masks     (own Docker image)
 |   |-- segmentation.py
@@ -90,24 +95,34 @@ rppg-pipeline/
 |
 |-- signal_analysis/            # CPU . video + masks + landmarks -> rPPG signal
 |   `-- analyze_signals.py
-|-- prepare_dataset/            # CPU . signal -> clean 20 s segments
-|   `-- prepare_dataset.py
-|-- hr_training/                # GPU . train the HR model
-|   |-- model.py  dataset.py  train.py
-|-- hb_training/                # GPU . train the Hb model
-|   |-- model.py  features.py  dataset.py  train.py
-|-- prediction/                 # CPU . DSP baseline + trained HR & Hb models -> tables + plots
-|   `-- predict.py
 |
-|-- tools/                      # standalone utilities
-|   `-- mcd_fps_sidecar.py      #   (MCD only) per-clip true fps from PPG duration
+|-- prepare_dataset/            # CPU . signal -> clean, resampled 20 s windows
+|   |-- __init__.py
+|   |-- prepare_dataset.py      #   entry point (run as `python -m prepare_dataset.prepare_dataset`)
+|   |-- window_generation.py    #   selects clean windows, skipping large gaps
+|   `-- signal_interpolation.py #   resamples onto a uniform grid using real timestamps
 |
-|-- data/                       # inputs  (mounted read-only)
-|   |-- videos/
-|   |-- ppg/                    #   contact-PPG .PW files (for HR labels)
-|   `-- ground_truth.csv        #   per-subject HR / Hb / biomarkers
+|-- hr_model/                   # GPU . train the HR model (spectral CNN)
+|   |-- __init__.py
+|   |-- model.py                #   HRSpectralNet
+|   |-- dataset.py
+|   |-- train.py                #   entry point (`python -m hr_model.train`)
+|   `-- visualize.py
 |
-`-- output/                     # all stage outputs (mounted read-write)
+|-- hb_model/                   # GPU . train the Hb model (feature MLP)
+|   |-- __init__.py
+|   |-- model.py                #   HbMLP
+|   |-- features.py             #   engineered amplitude / colour features
+|   |-- dataset.py
+|   |-- train.py                #   entry point (`python -m hb_model.train`)
+|   `-- visualization.py
+|
+`-- prediction/                 # CPU . DSP baselines + trained HR & Hb models -> table + plots
+    |-- __init__.py
+    |-- predict.py              #   entry point (`python -m prediction.predict`)
+    |-- models.py               #   loads the trained checkpoints for inference
+    |-- rppg_algorithms.py      #   POS / CHROM / green HR estimators
+    `-- visualization.py
 ```
 
 Two of the stages — `segmentation` and `landmarks` — carry their **own** Dockerfile and
@@ -115,14 +130,19 @@ requirements, because they load heavy vision models with their own dependencies.
 other stage runs on the single shared **`rppg-base`** image and mounts its code in, so a
 change to a script takes effect on the next run without rebuilding.
 
+> **Note.** `docker-compose.yml` currently ships with only the `rppg_prediction` service
+> active; the earlier stages are present as commented-out service blocks. Uncomment the
+> stage you want to run (or run its script directly, as shown below) and adjust its
+> `command:` flags as needed.
+
 ---
 
 ## Requirements
 
 - **Docker Engine** and **Docker Compose v2** (`docker compose ...`).
 - An **NVIDIA GPU** + driver + NVIDIA Container Toolkit for the GPU stages
-  (`segmentation`, `landmarks`, `hr_training`, `hb_training`). The CPU stages run without a
-  GPU. To run a GPU stage on CPU instead, delete its `deploy:` block from
+  (`segmentation`, `landmarks`, `hr_model`, `hb_model`). The CPU stages run without a
+  GPU. To run a GPU stage on CPU instead, remove its `deploy:` block from
   `docker-compose.yml` (training will be slower but works).
 - Input videos, and — if you want HR/Hb *labels* — contact-PPG files and/or a
   `ground_truth.csv` (see [Prepare your data](#prepare-your-data)).
@@ -148,14 +168,16 @@ Compose services mount each stage's folder and the `common/` package into the co
 run time.
 
 > **Run everything from the repository root.** The services mount `./common` into
-> `/app/common`, and every stage imports it as `from common import ...`, so the relative
-> mount paths only resolve from the root.
+> `/app/common`, and every stage imports it as a package (`from common import config`,
+> `from common.data_types import ...`), so the relative mount paths only resolve from the
+> root.
 
 ---
 
 ## Prepare your data
 
-Place inputs under `data/`:
+Place inputs under `data/` (this folder is mounted read-only into the containers and is
+not committed to the repo):
 
 ```
 data/
@@ -175,72 +197,46 @@ clip's filename, in the form `<subject>_<camera>_<state>`, e.g. `1020_FullHDwebc
 HR is still *predicted* but cannot be *scored*.
 
 **Ground truth (`data/ground_truth.csv`).** One row per subject/clip, keyed by
-`patient_id`, with a `hemoglobin` column (g/dL) and optionally other biomarkers. Hemoglobin
-is constant per subject. This file is required to train or score Hb.
+`patient_id`, with a `hemoglobin` column (g/dL) and optionally other biomarkers.
+Hemoglobin is constant per subject. This file is required to train or score Hb.
 
 ---
 
 ## Running the pipeline
 
-Each stage is a Compose service; run them in order with `docker compose run --rm`, from the
-repository root.
+Run the stages in order, from the repository root. The prediction stage is a ready-to-run
+Compose service; the other stages can be run either by uncommenting their service block in
+`docker-compose.yml` or by invoking their script directly inside the `rppg-base` image.
+The default flags below match the `command:` blocks in `docker-compose.yml`.
 
 ```bash
 # ---- Phase 1: per-frame GPU preprocessing (run once per dataset) ----
 docker compose run --rm segmentation      # videos -> output/seg/
 docker compose run --rm landmarks          # videos -> output/landmarks/
 
-# ---- (MCD dataset only) generate the fps sidecar first -- see the next section ----
-
-# ---- Phase 2: signal analysis and modelling (CPU unless noted) ----
+# ---- Phase 2: signal analysis and modelling ----
 docker compose run --rm signal_analysis    # -> output/signals/
-docker compose run --rm prepare_dataset    # -> output/train_data/
+docker compose run --rm prepare_dataset    # -> output/dataset/
 docker compose run --rm hr_training         # (GPU) -> output/hr_model/
 docker compose run --rm hb_training         # (GPU) -> output/hb_model/
 docker compose run --rm rppg_prediction     # -> output/prediction/
 ```
 
+The stage entry points and their key flags:
+
+| Stage             | Invocation                                    | Key flags (defaults) |
+| ----------------- | --------------------------------------------- | -------------------- |
+| `segmentation`    | `segmentation/segmentation.py`                | `--input-dir`, `--output-dir`, `--batch-size 8`, `--scale 1.0`, `--overwrite` |
+| `landmarks`       | `landmarks/landmarks.py`                       | `--input-dir`, `--output-dir`, `--device`, `--overwrite` |
+| `signal_analysis` | `signal_analysis/analyze_signals.py`           | `--video-dir`, `--seg-dir`, `--landmarks-dir`, `--signals-dir`, `--workers`, `--no-plot`, `--no-video`, `--overwrite` |
+| `prepare_dataset` | `python -m prepare_dataset.prepare_dataset`    | `--signals-dir`, `--ppg-dir`, `--ground-truth`, `--out-dir output/dataset`, `--workers` |
+| `hr_model`        | `python -m hr_model.train`                     | `--segments-dir output/dataset`, `--manifest`, `--out-dir output/hr_model`, `--epochs 80`, `--batch-size 128` |
+| `hb_model`        | `python -m hb_model.train`                     | `--segments-dir output/dataset`, `--manifest`, `--out-dir output/hb_model`, `--epochs 100`, `--batch-size 64` |
+| `prediction`      | `python -m prediction.predict`                 | `--dataset-dir output/dataset`, `--ppg-dir`, `--manifest`, `--out-dir output/prediction`, `--hr-model`, `--hb-model`, `--no-plot`, `--workers` |
+
 Stages are **resumable**: a clip whose output already exists is skipped, so you can stop
 and restart Phase 1. `signal_analysis` and `prepare_dataset` reuse existing outputs unless
-you pass `--overwrite` (add it to the service's `command` in `docker-compose.yml`).
-
-The service names are defined in `docker-compose.yml`; the exact flags for each stage live
-in that file's `command:` fields, so per-stage options are edited there.
-
----
-
-## Custom dataset vs MCD dataset
-
-The only real difference is **how frame timing is trusted**, which changes one flag on
-`signal_analysis`. (Background in [How timing is handled](#how-timing-is-handled).)
-
-### Custom dataset (your own recordings)
-
-If you record your own videos with real capture timestamps (e.g.
-`ffmpeg -use_wallclock_as_timestamps 1`), the pipeline trusts the video's own per-frame
-timestamps. **Run `signal_analysis` without `--fps-sidecar`** — remove that flag from the
-service's `command` in `docker-compose.yml`. Everything else is identical.
-
-### MCD dataset (MCD-rPPG)
-
-The MCD videos were re-encoded to a wrong constant frame rate, so their embedded timing
-can't be trusted directly. The true rate is recovered from the contact-PPG recording
-duration and supplied as a per-clip **sidecar** file. Generate it **once, before
-`signal_analysis`**, using the tool in `tools/` (CPU-only; it can run alongside Phase 1):
-
-```bash
-docker compose run --rm --entrypoint python signal_analysis \
-    tools/mcd_fps_sidecar.py --frames-from video \
-    --video-dir /data/videos --ppg-dir /data/ppg --out /output/mcd_fps.csv
-```
-
-This writes `output/mcd_fps.csv`. Then run `signal_analysis` **with**
-`--fps-sidecar /output/mcd_fps.csv` (as in the provided `docker-compose.yml`): clips listed
-in the sidecar use the corrected rate; any others fall back to their embedded timing. The
-sidecar must live under `output/` (writable), not `data/` (read-only).
-
-> If you re-generate or add the sidecar after already running `signal_analysis`, re-run it
-> with `--overwrite`, or the old (uncorrected) signals are kept.
+you pass `--overwrite`.
 
 ---
 
@@ -248,23 +244,24 @@ sidecar must live under `output/` (writable), not `data/` (read-only).
 
 Everything is written under `output/`:
 
-| Path | Produced by | Contents |
-| --- | --- | --- |
-| `output/seg/<clip>_seg.npz` | segmentation | per-frame skin/face parse masks |
-| `output/landmarks/<clip>_landmarks.npz` | landmarks | per-frame face landmarks |
-| `output/mcd_fps.csv` | mcd_fps_sidecar (MCD only) | corrected per-clip fps |
-| `output/signals/<clip>_signals.npz` | signal_analysis | rPPG signal + per-frame timestamps |
-| `output/train_data/<clip>_<k>_signals.npz` | prepare_dataset | clean 20 s segments |
-| `output/train_data/segments_manifest.csv` | prepare_dataset | each segment's time span |
-| `output/hr_model/` | hr_training | `hr_model.pt`, `history.csv`, `metrics.json`, `training_curves.png`, `test_scatter.png` |
-| `output/hb_model/` | hb_training | `hb_model.pt`, `history.csv`, `metrics.json`, `hb_test_scatter.png` |
-| `output/prediction/` | prediction | `hr_results.csv`, `hr_accuracy.png`, `hr_accuracy_by_condition.png`, `hr_by_condition.csv`, `plots/` |
+| Path                                       | Produced by      | Contents |
+| ------------------------------------------ | ---------------- | -------- |
+| `output/seg/<clip>_seg.npz`                | segmentation     | per-frame skin/face parse masks |
+| `output/landmarks/<clip>_landmarks.npz`    | landmarks        | per-frame face landmarks |
+| `output/signals/<clip>_signals.npz`        | signal_analysis  | rPPG signal + per-frame timestamps + pixel counts |
+| `output/dataset/<clip>_<k>_signals.npz`    | prepare_dataset  | clean, resampled 20 s windows |
+| `output/dataset/segments_manifest.csv`     | prepare_dataset  | each window's time span + labels |
+| `output/hr_model/`                         | hr_model.train   | `best_model.pt`, `last_model.pt`, `history.csv`, `metrics.json`, `model_config.json`, training/scatter plots |
+| `output/hb_model/`                         | hb_model.train   | `best_model.pt`, `last_model.pt`, `history.csv`, `metrics.json`, `model_config.json`, scatter plots |
+| `output/prediction/`                       | prediction       | `hr_results.csv`, `hr_accuracy.png`, `hb_accuracy.png`, `plots/<segment>.png` |
 
-The prediction stage's `hr_results.csv` has one row per segment: HR from each DSP method
-(POS/CHROM/green) with a confidence, the PPG-derived HR label, the trained HR model's
-prediction (`hr_model`), and the trained Hb model's prediction (`hb_pred`). Its plots show
-predicted-vs-true HR per method, error broken down by exercise state x camera, and a
-per-segment panel figure.
+The prediction stage's `hr_results.csv` has one row per window with these columns:
+`segment`, `clip`, `t_start`, `t_end`, `hr_pos`, `conf_pos`, `hr_chrom`, `conf_chrom`,
+`hr_green`, `conf_green`, `hr_label`, `hr_pred`, `hr_pred_conf`, `hb_label`, `hb_pred`.
+That is: HR from each DSP method (POS / CHROM / green) with a confidence, the PPG-derived
+HR label, the trained HR model's prediction (`hr_pred`) with its confidence, and the Hb
+label and trained Hb model prediction (`hb_pred`). Its plots show predicted-vs-true HR and
+Hb, plus a per-segment panel figure under `plots/`.
 
 ---
 
@@ -272,23 +269,32 @@ per-segment panel figure.
 
 **Intermediate `.npz`**
 
-| File | Key | Shape | Meaning |
-| --- | --- | --- | --- |
-| `seg/<clip>_seg.npz` | `masks` | `(T, H, W)` | per-pixel parse-class id per frame |
-| `landmarks/<clip>_landmarks.npz` | `landmarks` | `(T, 478, 3)` | landmark `(x, y, z)`; NaN where no face |
-| `signals/<clip>_signals.npz` | `signals` | `(3, T, 3)` | per-region mean RGB (region x frame x RGB) |
-| | `timestamps` | `(T,)` | per-frame capture time in seconds |
-| `train_data/<clip>_<k>_signals.npz` | `signals` | `(3, 600, 3)` | clean 20 s segment, uniform 30 Hz |
-| | `fps` | scalar | sample rate (30) |
+| File                                | Key            | Shape         | Meaning |
+| ----------------------------------- | -------------- | ------------- | ------- |
+| `seg/<clip>_seg.npz`                | `masks`        | `(T, H, W)`   | per-pixel parse-class id per frame |
+| `landmarks/<clip>_landmarks.npz`    | `landmarks`    | `(T, 478, 3)` | landmark `(x, y, z)`; NaN where no face |
+| `signals/<clip>_signals.npz`        | `signals`      | `(3, T, 3)`   | per-region mean RGB (region x frame x RGB) |
+|                                     | `timestamps`   | `(T,)`        | per-frame capture time in seconds |
+|                                     | `pixel_counts` | `(3, T)`      | valid pixels per region per frame (quality) |
+| `dataset/<clip>_<k>_signals.npz`    | `signals`      | `(3, 300, 3)` | clean 20 s window, uniform 15 Hz |
+|                                     | `pixel_counts` | `(3, 300)`    | per-region quality over the window |
+|                                     | `region_mask`  | `(3,)`        | which regions are valid for this window |
+|                                     | `fps`          | scalar        | sample rate (15) |
 
 The three regions are, in order, **forehead, left cheek, right cheek**.
 
-**`segments_manifest.csv`** — `segment, clip, index, t_start, t_end, abs_start`: the real
-time span each segment was cut from, used to label it from the contact PPG.
+The windowing parameters live in `common/config.py`: `WINDOW_SEC = 20.0` and
+`TARGET_FPS = 15`, so each window is `20 x 15 = 300` samples. The DSP HR band is
+`HR_FREQ_MIN_HZ = 0.83` to `HR_FREQ_MAX_HZ = 2.8` (~50–168 BPM).
 
-**Trained-model checkpoints** — `hr_model.pt` / `hb_model.pt` bundle the network weights
-plus the exact normalisation used at training time, so the prediction stage reproduces
-training-time preprocessing precisely.
+**`segments_manifest.csv`** — one row per window with its `segment`, source `clip`,
+`index`, `t_start`, `t_end` and absolute start time, plus the labels resolved from the
+contact PPG and ground-truth CSV. Used to match each window to its HR/Hb labels.
+
+**Trained-model checkpoints** — each model directory holds `best_model.pt` and
+`last_model.pt` (network weights) alongside `model_config.json` and `metrics.json`, so the
+prediction stage reproduces training-time preprocessing precisely. Point `prediction` at a
+model directory with `--hr-model` / `--hb-model`.
 
 ---
 
@@ -297,35 +303,31 @@ training-time preprocessing precisely.
 rPPG is a *frequency* measurement, so the signal's time axis must be correct.
 `signal_analysis` does **not** trust a video header's nominal frame rate; it reads each
 frame's real presentation timestamp and stores the per-frame times alongside the signal.
-Downstream, `prepare_dataset` resamples each segment onto a uniform 30 Hz grid *using those
-real timestamps* (monotonic-cubic interpolation), which fills short gaps and yields uniform
-segments without stretching or compressing the pulse — a heartbeat stays at its true
-frequency even if the camera's frame rate was variable or mislabelled.
+Downstream, `prepare_dataset` resamples each window onto a uniform 15 Hz grid *using those
+real timestamps* (interpolation), which fills short gaps and yields uniform windows without
+stretching or compressing the pulse — a heartbeat stays at its true frequency even if the
+camera's frame rate was variable or mislabelled.
 
-Segments are only cut from clean stretches: a candidate 20 s window is rejected if it
-contains a gap longer than ~1 s, or more than ~5 s of missing/invalid frames in total, so
-the modelling data is free of large dropouts.
-
-The one dataset-specific wrinkle is the MCD re-encoding issue handled by the fps sidecar,
-described above.
+Windows are only cut from clean stretches: a candidate 20 s window is rejected if it
+contains a gap longer than `MAX_GAP_SEC` (~1 s) or too much missing/invalid data, so the
+modelling data is free of large dropouts. If you record your own videos, capture real
+per-frame timestamps (e.g. `ffmpeg -use_wallclock_as_timestamps 1`) so this stage has an
+accurate time axis to work from.
 
 ---
 
 ## Notes on accuracy
 
-**Heart rate.** The classical DSP methods (POS, CHROM, green) are reported per segment as a
+**Heart rate.** The classical DSP methods (POS, CHROM, green) are reported per window as a
 baseline and are prone to picking a wrong spectral peak (an octave or a 2:3 ratio off),
-especially at elevated heart rates. The trained HR model learns to pick the true peak and
-is the more reliable estimate. HR is scored in **MAE (BPM)** and **within-6-BPM %** against
-the contact PPG; the prediction stage also breaks error down by exercise state and camera
-so weaknesses are visible rather than averaged away.
+especially at elevated heart rates. The trained HR model (`HRSpectralNet`, a small 1-D
+convolutional network over log-power spectra) learns to pick the true peak and is the more
+reliable estimate. HR is scored against the contact PPG.
 
 **Hemoglobin.** Hb from rPPG is a **much weaker signal** than HR — it is inferred from
-subtle colour/absorption cues rather than an obvious pulse frequency. The Hb stage is built
-to report honestly: it always compares against a **naive baseline** (predicting the mean),
-includes a **memorisation check** (train-subject vs held-out-subject error), and reports
-per-subject as well as per-segment metrics. Treat a result as real only if it beats the
-naive baseline on **held-out subjects**.
+subtle colour/absorption cues rather than an obvious pulse frequency, using engineered
+amplitude/colour features fed to a small MLP (`HbMLP`). Treat a result as real only if it
+clearly beats a naive mean-predicting baseline on **held-out subjects**.
 
 Both training stages split **by subject** — a subject never appears in more than one of
 train/validation/test — so reported accuracy reflects generalisation to new people, not

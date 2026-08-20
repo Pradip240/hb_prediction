@@ -131,7 +131,7 @@ WINDOW_SEC = 20.0
 WINDOW_STEP_SEC = 15
 
 # Minimum number of facial regions that must satisfy the quality criteria for a window to be accepted.
-MIN_VALID_REGIONS = 1
+MIN_VALID_REGIONS = 2
 
 # Maximum duration of an individual missing-data gap allowed within a training window.
 MAX_GAP_SEC = 1.0
@@ -144,7 +144,7 @@ MAX_TOTAL_BROKEN_SEC = 5.0
 GAP_FACTOR = 2.0
 
 # Target sampling frequency after interpolation (Hz).
-TARGET_FPS = 15
+TARGET_FPS = 30
 
 
 
@@ -171,7 +171,7 @@ REGION_WEIGHT_SMOOTH_SEC = 1.0
 POS_WINDOW_SEC = 1.6
 
 # Physiological heart-rate frequency range used by rPPG algorithms (Hz).
-HR_FREQ_MIN_HZ = 0.83    # ~50 BPM
+HR_FREQ_MIN_HZ = 0.9     # ~54 BPM
 HR_FREQ_MAX_HZ = 2.8     # ~168 BPM
 
 # Order of the Butterworth bandpass filter used by CHROM and other signal-processing methods.
@@ -181,4 +181,4 @@ BANDPASS_ORDER = 3
 #
 # Larger values produce a smoother estimated baseline and therefore remove
 # slower variations more aggressively.
-DETREND_LAMBDA = 10.0
+DETREND_LAMBDA = 100.0

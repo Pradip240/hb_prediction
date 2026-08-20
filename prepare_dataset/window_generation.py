@@ -9,7 +9,7 @@ signal interpolation or file I/O.
 import numpy as np
 
 from common import config
-from common.data_types import WindowInfo, BrokenInterval
+from common.data_types import BrokenInterval, WindowInfo
 
 
 def _measure_broken_intervals(timestamps: np.ndarray, valid_samples: np.ndarray) -> list[BrokenInterval]:

@@ -1,14 +1,13 @@
 import json
 
-import torch
 import numpy as np
+import torch
 
 from common import config
-from hr_model.model import HRSpectralNet
-from hr_model.dataset import SpectralDataset
-from hb_model.model import HbMLP
 from hb_model.features import extract_features
-
+from hb_model.model import HbMLP
+from hr_model.dataset import SpectralDataset
+from hr_model.model import HRSpectralNet
 
 _HR_MODEL: HRSpectralNet | None = None
 _HB_MODEL: HbMLP | None = None

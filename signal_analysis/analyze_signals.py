@@ -76,8 +76,8 @@ Frames are aligned by index:
 The number of processed frames is limited to the shortest available input.
 """
 
-import os
 import argparse
+import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import cv2
@@ -85,9 +85,9 @@ import numpy as np
 
 from common import config
 from common import signal_processing as sp
-from common.data_types import ClipResult, ClipTask, FileExtension, VIDEO_EXTENSIONS
-from common.visualize import plot_signals, make_overlay_frame
-from common.video_utils import video_timestamps, video_fps
+from common.data_types import VIDEO_EXTENSIONS, ClipResult, ClipTask, FileExtension
+from common.video_utils import video_fps, video_timestamps
+from common.visualize import make_overlay_frame, plot_signals
 
 
 def _init_worker() -> None:
@@ -98,8 +98,8 @@ def _init_worker() -> None:
     """
     try:
         cv2.setNumThreads(1)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Failed to initialize worker: {e}")
 
 
 def _default_workers() -> int:
@@ -166,14 +166,14 @@ def process_clip(task: ClipTask) -> ClipResult:
         # Open the video for sequential frame decoding.
         capture = cv2.VideoCapture(task.video_path)
         if not capture.isOpened():
-            raise IOError(task.video_path)
+            raise OSError(task.video_path)
 
         # Create overlay writer if needed.
         writer = None
         if need_overlay:
             width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            writer = cv2.VideoWriter(task.overlay_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)) # type: ignore
+            writer = cv2.VideoWriter(task.overlay_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))  # type: ignore
 
         processed_frames = 0
         # Decode and process video frames.
@@ -199,7 +199,9 @@ def process_clip(task: ClipTask) -> ClipResult:
 
                 # Write overlay.
                 if writer is not None:
-                    vis = make_overlay_frame(frame, smoothed_masks[frame_idx], region_masks, smoothed_landmarks[frame_idx])
+                    vis = make_overlay_frame(
+                        frame, smoothed_masks[frame_idx], region_masks, smoothed_landmarks[frame_idx]
+                    )
                     writer.write(vis)
         finally:
             capture.release()
@@ -218,13 +220,13 @@ def process_clip(task: ClipTask) -> ClipResult:
             np.savez_compressed(task.signal_path, signals=signals, timestamps=timestamps, pixel_counts=pixel_counts)
 
             # A region is valid if all three RGB values are finite
-            valid_regions = np.isfinite(signals).all(axis=-1)   # Shape: (T, R)
+            valid_regions = np.isfinite(signals).all(axis=-1)  # Shape: (T, R)
             # A frame is valid if all regions are valid
-            valid_frames = valid_regions.any(axis=-1)            # Shape: (T,)
+            valid_frames = valid_regions.any(axis=-1)  # Shape: (T,)
             # Fraction of valid frames
             valid_fraction = valid_frames.mean() if signals.size else 0.0
             # Calculate duration
-            duration = (timestamps[-1] - timestamps[0] if len(timestamps) else 0.0)
+            duration = timestamps[-1] - timestamps[0] if len(timestamps) else 0.0
 
             # Add logs
             messages.append(
@@ -240,7 +242,6 @@ def process_clip(task: ClipTask) -> ClipResult:
             timestamps = data["timestamps"]
             messages.append(f"{task.name}: signals exist, skip extraction {signals.shape}")
 
-
         # Plot signals
         if not task.no_plot:
             if need_plot:
@@ -248,7 +249,6 @@ def process_clip(task: ClipTask) -> ClipResult:
                 messages.append(f"  plot -> {task.plot_path}")
             else:
                 messages.append("   plot exists, skip")
-
 
         # Send overlay video message
         if not task.no_video:
@@ -262,9 +262,7 @@ def process_clip(task: ClipTask) -> ClipResult:
 
 
 def main() -> None:
-    """
-    Extract rPPG signals for all videos in a directory.
-    """
+    """Extract rPPG signals for all videos in a directory."""
     # Parse arguments
     ap = argparse.ArgumentParser(
         description=("Extract per-region rPPG RGB signals from segmentation masks and landmarks.")
@@ -274,9 +272,7 @@ def main() -> None:
     ap.add_argument("--landmarks-dir", default="output/landmarks")
     ap.add_argument("--signals-dir", default="output/signals")
     ap.add_argument("--plots-dir", default="output/plots")
-    ap.add_argument("--workers", type=int, default=0,
-        help=("Number of worker processes (0 = all available cores).")
-    )
+    ap.add_argument("--workers", type=int, default=0, help=("Number of worker processes (0 = all available cores)."))
     ap.add_argument("--no-plot", action="store_true", help="Disable signal plots.")
     ap.add_argument("--no-video", action="store_true", help="Disable overlay videos.")
     ap.add_argument("--overwrite", action="store_true", help="Redo existing outputs.")
@@ -288,7 +284,9 @@ def main() -> None:
 
     # List available segmentation archives
     seg_files: list[str] = sorted(
-        f for f in os.listdir(args.seg_dir) if f.endswith(FileExtension.SEGMENTATION) # type: ignore
+        file
+        for file in os.listdir(args.seg_dir)  # type: ignore
+        if file.endswith(FileExtension.SEGMENTATION)  # type: ignore
     )
     print(f"Loaded {len(seg_files)} segmentation file(s)")
 
@@ -319,18 +317,20 @@ def main() -> None:
             continue
 
         # Create processing task
-        tasks.append(ClipTask(
-            name=name,
-            video_path=video_path,
-            segmentation_path=seg_path,
-            landmark_path=landmark_path,
-            signal_path=os.path.join(args.signals_dir, f"{name}{FileExtension.SIGNALS}"),
-            plot_path=os.path.join(args.plots_dir, f"{name}{FileExtension.SIGNAL_PLOT}"),
-            overlay_path=os.path.join(args.plots_dir, f"{name}{FileExtension.VIDEO_OVERLAY}"),
-            no_plot=args.no_plot,
-            no_video=args.no_video,
-            overwrite=args.overwrite,
-        ))
+        tasks.append(
+            ClipTask(
+                name=name,
+                video_path=video_path,
+                segmentation_path=seg_path,
+                landmark_path=landmark_path,
+                signal_path=os.path.join(args.signals_dir, f"{name}{FileExtension.SIGNALS}"),
+                plot_path=os.path.join(args.plots_dir, f"{name}{FileExtension.SIGNAL_PLOT}"),
+                overlay_path=os.path.join(args.plots_dir, f"{name}{FileExtension.VIDEO_OVERLAY}"),
+                no_plot=args.no_plot,
+                no_video=args.no_video,
+                overwrite=args.overwrite,
+            )
+        )
 
     # Exit if no clips are available
     if not tasks:

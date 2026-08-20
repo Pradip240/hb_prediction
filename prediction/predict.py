@@ -1,4 +1,5 @@
-"""Run HR and hemoglobin prediction over prepared dataset segments.
+"""
+Run HR and hemoglobin prediction over prepared dataset segments.
 
 Inputs
 ------
@@ -75,25 +76,40 @@ python predict.py \
     [--no-plot]
 """
 
-import os
-import csv
 import argparse
-from dataclasses import asdict, fields
+import csv
+import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import asdict, fields
 
-import torch
 import numpy as np
+import torch
 
 from common.data_types import (
-    FileExtension, WindowInfo, PredictionTask, PredictionRecord, PredictionResult, PPGSignal
+    FileExtension,
+    PPGSignal,
+    PredictionRecord,
+    PredictionResult,
+    PredictionTask,
+    WindowInfo,
 )
 from common.ppg import load_pw, ppg_segment
-from prediction.models import predict_hr, predict_hb
+from prediction.models import predict_hb, predict_hr
 from prediction.rppg_algorithms import method_waveforms
-from prediction.visualization import plot_segment, write_accuracy_plot, write_hb_accuracy_plot
+from prediction.visualization import (
+    plot_segment,
+    write_accuracy_plot,
+    write_hb_accuracy_plot,
+)
 
 
-def _default_workers():
+def _default_workers() -> int:
+    """
+    Return the default number of worker threads/processes.
+
+    Returns:
+        The number of available CPUs, or 1 if the CPU count cannot be determined.
+    """
     try:
         return len(os.sched_getaffinity(0))
     except AttributeError:
@@ -149,7 +165,7 @@ def process_segment(task: PredictionTask) -> PredictionResult:
             hr_pred=hr_pred,
             hr_pred_conf=hr_pred_conf,
             hb_label=task.hb_true,
-            hb_pred=hb_pred
+            hb_pred=hb_pred,
         )
 
         # Plot the prediction results
@@ -167,7 +183,7 @@ def process_segment(task: PredictionTask) -> PredictionResult:
                 ppg_wave=ppg_wave,
                 output_path=os.path.join(plots_dir, f"{task.name}.png"),
                 hr_model_prediction=hr_model_prediction,
-                hb_pred=hb_pred
+                hb_pred=hb_pred,
             )
         return PredictionResult(name=task.name, prediction=prediction, success=True, error=None)
     except Exception as exc:
@@ -175,13 +191,9 @@ def process_segment(task: PredictionTask) -> PredictionResult:
 
 
 def main() -> None:
-    """
-    Predict HR and Hb over dataset segments.
-    """
+    """Predict HR and Hb over dataset segments."""
     # Parse arguments.
-    ap = argparse.ArgumentParser(
-        description="HR (DSP + trained model) and Hb prediction over dataset segments."
-    )
+    ap = argparse.ArgumentParser(description="HR (DSP + trained model) and Hb prediction over dataset segments.")
     ap.add_argument("--dataset-dir", default="output/dataset")
     ap.add_argument("--manifest", default="output/dataset/segments_manifest.csv")
     ap.add_argument("--ppg-dir", default="data/ppg")
@@ -189,9 +201,7 @@ def main() -> None:
     ap.add_argument("--no-plot", action="store_true", help="Disable prediction plots.")
     ap.add_argument("--hr-model", default=None, help="Optional path to a trained HR model.")
     ap.add_argument("--hb-model", default=None, help="Optional path to a trained Hb model.")
-    ap.add_argument("--workers", type=int, default=0,
-        help="Number of worker processes (0 = all available cores)."
-    )
+    ap.add_argument("--workers", type=int, default=0, help="Number of worker processes (0 = all available cores).")
     args = ap.parse_args()
 
     # Create the output directory.
@@ -243,18 +253,20 @@ def main() -> None:
         )
 
         # Create the prediction task
-        tasks.append(PredictionTask(
-            name=segment_name,
-            sample_path=sample_path,
-            segment=window,
-            ppg_info=ppg_info,
-            output_dir=args.out_dir,
-            no_plot=args.no_plot,
-            hr_model=args.hr_model,
-            hb_model=args.hb_model,
-            hr_true=float(row["ppg_hr"]) if row.get("ppg_hr") else float(row["pulse"]),
-            hb_true=float(row["hemoglobin"])
-        ))
+        tasks.append(
+            PredictionTask(
+                name=segment_name,
+                sample_path=sample_path,
+                segment=window,
+                ppg_info=ppg_info,
+                output_dir=args.out_dir,
+                no_plot=args.no_plot,
+                hr_model=args.hr_model,
+                hb_model=args.hb_model,
+                hr_true=float(row["ppg_hr"]) if row.get("ppg_hr") else float(row["pulse"]),
+                hb_true=float(row["hemoglobin"]),
+            )
+        )
 
     print(f"Created {len(tasks)} prediction task(s)")
     if not tasks:
@@ -276,7 +288,7 @@ def main() -> None:
                 print(f"[{index}/{len(tasks)}] {prediction.name}: ERROR {prediction.error}")
 
     # Sort prediction results
-    predictions.sort(key=lambda result: (result.prediction.segment if result.prediction else result.name))
+    predictions.sort(key=lambda result: result.prediction.segment if result.prediction else result.name)
 
     # Save prediction results to CSV
     csv_path = os.path.join(args.out_dir, "hr_results.csv")
@@ -284,19 +296,21 @@ def main() -> None:
     with open(csv_path, "w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=field_names)
         writer.writeheader()
-        writer.writerows(
-            asdict(result.prediction) for result in predictions if result.prediction is not None
-        )
+        writer.writerows(asdict(result.prediction) for result in predictions if result.prediction is not None)
 
     print(f"\nGenerated {len(predictions)} prediction result(s)")
     print(f"Results -> {csv_path}")
 
-    # Build rows for accuracy reporting and visualization.
-    rows = [asdict(result.prediction) for result in predictions if result.prediction is not None]
+    # Build rows for accuracy reporting and visualization from teh csv file.
+    rows = []
+    with open(csv_path, "r", newline="", encoding="utf-8-sig") as file:
+        reader = csv.DictReader(file)
+        rows = list(reader)
+    print(f"Reloaded {len(rows)} row(s) from {csv_path} for accuracy reporting and visualization.")
 
     # Convert a CSV value to float, returning NaN for missing values.
     def col(name: str) -> np.ndarray:
-        return np.array([float(row[name]) if row.get(name, "") not in ("", None) else np.nan for row in rows ])
+        return np.array([float(row[name]) if row.get(name, "") not in ("", None) else np.nan for row in rows])
 
     # Print aggregate HR accuracy for each prediction method.
     lab = col("hr_label")
@@ -327,7 +341,7 @@ def main() -> None:
         correlation = np.corrcoef(pred, true)[0, 1] if np.std(pred) > 0 and np.std(true) > 0 else float("nan")
         ss_res = np.sum((true - pred) ** 2)
         ss_tot = np.sum((true - np.mean(true)) ** 2)
-        r2 = 1.0 - (ss_res / ss_tot) 
+        r2 = 1.0 - (ss_res / ss_tot)
         naive_mae = np.mean(np.abs(np.mean(true) - true))
 
         print("\n=== Hb accuracy vs ground truth ===")

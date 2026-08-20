@@ -40,12 +40,12 @@ Each pixel stores the predicted face-parsing class ID, with 0 representing
 background. The model's class ID to label mapping is printed once at startup.
 """
 
-import os
 import argparse
+import os
 
 import cv2
-import torch
 import numpy as np
+import torch
 from PIL import Image
 from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
 
@@ -53,32 +53,32 @@ VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".mov")
 
 
 def main() -> None:
-    """
-    Process all input videos and save per-frame face-parsing masks as .npz files.
-    """
+    """Process all input videos and save per-frame face-parsing masks as .npz files."""
     # Parse arguments
     ap = argparse.ArgumentParser(description="Save per-frame face-parse masks as .npz.")
     ap.add_argument("--input-dir", default="videos")
     ap.add_argument("--output-dir", default="seg")
     ap.add_argument("--device", default=None, help="'cuda' or 'cpu' (auto if omitted)")
-    ap.add_argument("--batch-size", type=int, default=8, choices=range(1, 64),
-                    help="number of frames processed per GPU batch")
-    ap.add_argument("--scale", type=float, default=1.0,
-                    help="resize each mask by this factor (nearest); <1 shrinks the output")
+    ap.add_argument(
+        "--batch-size", type=int, default=8, choices=range(1, 64), help="number of frames processed per GPU batch"
+    )
+    ap.add_argument(
+        "--scale", type=float, default=1.0, help="resize each mask by this factor (nearest); <1 shrinks the output"
+    )
     ap.add_argument("--overwrite", action="store_true", help="redo clips whose .npz exists")
     args = ap.parse_args()
 
     # Create model and processor
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    processor = SegformerImageProcessor.from_pretrained('jonathandinu/face-parsing') # type: ignore
-    model = SegformerForSemanticSegmentation.from_pretrained('jonathandinu/face-parsing').to(device).eval() # type: ignore
+    processor = SegformerImageProcessor.from_pretrained("jonathandinu/face-parsing")  # type: ignore
+    model = SegformerForSemanticSegmentation.from_pretrained("jonathandinu/face-parsing").to(device).eval()  # type: ignore
     if device == "cuda":
         torch.backends.cudnn.benchmark = True
     print(f"device={device}  class legend: {model.config.id2label}")
 
     # List videos to process
     os.makedirs(args.output_dir, exist_ok=True)
-    videos: list[str] = sorted(f for f in os.listdir(args.input_dir) if f.lower().endswith(VIDEO_EXTS)) # type: ignore
+    videos: list[str] = sorted(f for f in os.listdir(args.input_dir) if f.lower().endswith(VIDEO_EXTS))  # type: ignore
     print(f"{len(videos)} video(s) in {args.input_dir}")
 
     # Start procesing each video
@@ -106,7 +106,7 @@ def main() -> None:
             # Process batch
             if len(batch_frames) == args.batch_size or (not ok and batch_frames):
                 images = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in batch_frames]
-                inputs = processor(images=images, return_tensors="pt").to(device) # type: ignore
+                inputs = processor(images=images, return_tensors="pt").to(device)  # type: ignore
                 with torch.inference_mode():
                     logits = model(**inputs).logits
                 logits = torch.nn.functional.interpolate(

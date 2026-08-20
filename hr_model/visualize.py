@@ -1,4 +1,5 @@
-"""Visualization utilities for HRSpectralNet training.
+"""
+Visualization utilities for HRSpectralNet training.
 
 This module provides utilities for visualizing model training history and
 final test-set performance.
@@ -14,6 +15,7 @@ be generated in headless training environments.
 import os
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 

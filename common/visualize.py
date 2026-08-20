@@ -5,11 +5,11 @@ Provides helpers for plotting extracted signals and generating overlay videos.
 """
 
 import cv2
+import matplotlib
 import numpy as np
 from cv2.typing import MatLike
 from numpy.typing import NDArray
 
-import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -34,37 +34,33 @@ def plot_signals(signals: np.ndarray, timestamps: np.ndarray, clip_name: str, ou
     duration = time_axis[-1] if len(time_axis) else 0.0
 
     # Create one subplot for each RGB channel.
-    fig, axes = plt.subplots(n_channels, 1, figsize=(12, 9), sharex=True) # type: ignore
+    fig, axes = plt.subplots(n_channels, 1, figsize=(12, 9), sharex=True)  # type: ignore
     channels = ["Red", "Green", "Blue"]
     for channel in range(len(channels)):
-        ax = axes[channel] # type: ignore
+        ax = axes[channel]  # type: ignore
 
         # Plot the mean RGB signal for every facial region.
         for region, region_name in enumerate(config.REGION_ORDER):
             bgr_color = np.array(config.REGION_COLORS[region_name], dtype=np.float32)
             color = (bgr_color[::-1] / 255).tolist()
-            ax.plot( # type: ignore
-                time_axis,
-                signals[:, region, channel],
-                color=color,
-                linewidth=1.0,
-                label=region_name
+            ax.plot(  # type: ignore
+                time_axis, signals[:, region, channel], color=color, linewidth=1.0, label=region_name
             )
 
         # Label the current channel with legend and show a light grid.
-        ax.set_ylabel(f"Mean {channels[channel]}") # type: ignore
-        ax.grid(alpha=0.3) # type: ignore
+        ax.set_ylabel(f"Mean {channels[channel]}")  # type: ignore
+        ax.grid(alpha=0.3)  # type: ignore
         if channel == 0:
-            ax.legend(loc="upper right", fontsize=8) # type: ignore
+            ax.legend(loc="upper right", fontsize=8)  # type: ignore
 
-    axes[-1].set_xlabel("Time (s)") # type: ignore
+    axes[-1].set_xlabel("Time (s)")  # type: ignore
     # Add an overall title with clip metadata.
-    fig.suptitle( # type: ignore
+    fig.suptitle(  # type: ignore
         f"Per-region skin RGB — {clip_name} ({duration:.1f}s, {n_frames} frames)", fontweight="bold"
     )
     # Adjust layout, save the figure, and release resources.
-    plt.tight_layout(rect=[0, 0, 1, 0.98]) # type: ignore
-    plt.savefig(output_path, dpi=130) # type: ignore
+    plt.tight_layout(rect=[0, 0, 1, 0.98])  # type: ignore
+    plt.savefig(output_path, dpi=130)  # type: ignore
     plt.close(fig)
 
 
@@ -95,7 +91,7 @@ def make_overlay_frame(
     tint = np.zeros_like(vis)
     tint[skin_mask > 0] = (0, 180, 0)
 
-    vis = cv2.addWeighted(vis, 1.0, tint,config.OVERLAY_SKIN_TINT_ALPHA, 0)
+    vis = cv2.addWeighted(vis, 1.0, tint, config.OVERLAY_SKIN_TINT_ALPHA, 0)
 
     # Scale factor for sub-pixel polygon rendering.
     factor = 1 << config.SUBPIX_SHIFT

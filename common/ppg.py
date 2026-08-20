@@ -1,6 +1,4 @@
-"""
-Utilities for loading and extracting contact PPG signals.
-"""
+"""Utilities for loading and extracting contact PPG signals."""
 
 from datetime import datetime
 

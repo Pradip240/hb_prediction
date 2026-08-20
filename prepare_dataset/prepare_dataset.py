@@ -54,19 +54,28 @@ For each extracted signal archive:
     - Record window metadata.
 """
 
-import os
-import csv
 import argparse
+import csv
+import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 
 from common import config
-from common.data_types import DatasetTask, DatasetResult, FileExtension, WindowInfo, PPGSignal
+from common.data_types import (
+    DatasetResult,
+    DatasetTask,
+    FileExtension,
+    PPGSignal,
+    WindowInfo,
+)
 from common.ppg import load_pw, ppg_segment
 from common.signal_processing import spectral_hr
+from prepare_dataset.signal_interpolation import (
+    resample_pixel_counts,
+    resample_region_signals,
+)
 from prepare_dataset.window_generation import find_windows
-from prepare_dataset.signal_interpolation import resample_region_signals, resample_pixel_counts
 
 
 def _default_workers() -> int:
@@ -92,7 +101,7 @@ def _write_manifest(windows: list[WindowInfo], output_dir: str, ppg_dir: str, gr
     Args:
         windows: Metadata for all emitted windows.
         output_dir: Dataset output directory.
-        ppg_dir: Directory containing the contact PPG files. 
+        ppg_dir: Directory containing the contact PPG files.
         ground_truth: Path to the ground-truth CSV file.
     """
     windows.sort(key=lambda window: (window.clip, window.index))
@@ -125,35 +134,31 @@ def _write_manifest(windows: list[WindowInfo], output_dir: str, ppg_dir: str, gr
                     ppg_data = load_pw(ppg_file)
 
             # Store all metadata so it can be added to every segment generated from this clip.
-            ground_truth_data[clip] = (
-                patient_id,
-                pulse,
-                hemoglobin,
-                ppg_file,
-                ppg_data
-            )
+            ground_truth_data[clip] = (patient_id, pulse, hemoglobin, ppg_file, ppg_data)
 
     manifest_path = os.path.join(output_dir, "segments_manifest.csv")
 
     with open(manifest_path, "w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
 
-        writer.writerow([
-            "segment",
-            "clip",
-            "index",
-            "t_start",
-            "t_end",
-            "abs_start",
-            "patient_id",
-            "pulse",
-            "hemoglobin",
-            "ppg_file",
-            "ppg_hr",
-            "ppg_start",
-            "ppg_end",
-            "ppg_sampling_frequency"
-        ])
+        writer.writerow(
+            [
+                "segment",
+                "clip",
+                "index",
+                "t_start",
+                "t_end",
+                "abs_start",
+                "patient_id",
+                "pulse",
+                "hemoglobin",
+                "ppg_file",
+                "ppg_hr",
+                "ppg_start",
+                "ppg_end",
+                "ppg_sampling_frequency",
+            ]
+        )
 
         for index, window in enumerate(windows, 1):
             print(f"[{index}/{len(windows)}] {window.segment}")
@@ -184,22 +189,24 @@ def _write_manifest(windows: list[WindowInfo], output_dir: str, ppg_dir: str, gr
                     except Exception as error:
                         print(f"  [ERROR] Failed to calculate PPG HR: {window.segment}: {error}")
             # Write window, ground-truth, and PPG metadata.
-            writer.writerow([
-                window.segment,
-                window.clip,
-                window.index,
-                window.t_start,
-                window.t_end,
-                window.abs_start,
-                patient_id,
-                pulse,
-                hemoglobin,
-                ppg_file,
-                ppg_hr,
-                ppg_start,
-                ppg_end,
-                ppg_sampling_frequency
-            ])
+            writer.writerow(
+                [
+                    window.segment,
+                    window.clip,
+                    window.index,
+                    window.t_start,
+                    window.t_end,
+                    window.abs_start,
+                    patient_id,
+                    pulse,
+                    hemoglobin,
+                    ppg_file,
+                    ppg_hr,
+                    ppg_start,
+                    ppg_end,
+                    ppg_sampling_frequency,
+                ]
+            )
 
 
 def process_dataset_task(task: DatasetTask) -> DatasetResult:
@@ -239,11 +246,7 @@ def process_dataset_task(task: DatasetTask) -> DatasetResult:
         # Nothing to emit.
         if not windows:
             return DatasetResult(
-                name=task.name,
-                log=f"{task.name}: no valid windows.",
-                windows=[],
-                count=0,
-                success=True
+                name=task.name, log=f"{task.name}: no valid windows.", windows=[], count=0, success=True
             )
 
         messages.append(f"{task.name}: {len(windows)} window(s)")
@@ -262,9 +265,8 @@ def process_dataset_task(task: DatasetTask) -> DatasetResult:
             window_counts = pixel_counts[first:last]
 
             # Construct the target uniformly sampled timeline.
-            output_times = (
-                window.abs_start
-                + np.arange(0.0, config.WINDOW_SEC, 1.0 / config.TARGET_FPS, dtype=np.float64)
+            output_times = window.abs_start + np.arange(
+                0.0, config.WINDOW_SEC, 1.0 / config.TARGET_FPS, dtype=np.float64
             )
 
             # Interpolate RGB signals.
@@ -285,43 +287,29 @@ def process_dataset_task(task: DatasetTask) -> DatasetResult:
                 signals=resampled_signals,
                 pixel_counts=resampled_pixel_counts,
                 region_mask=window.region_mask,
-                fps=np.float32(config.TARGET_FPS)
+                fps=np.float32(config.TARGET_FPS),
             )
             absolute_windows.append(window)
 
         return DatasetResult(
-            name=task.name,
-            log="\n".join(messages),
-            windows=absolute_windows,
-            count=len(absolute_windows),
-            success=True
+            name=task.name, log="\n".join(messages), windows=absolute_windows, count=len(absolute_windows), success=True
         )
 
     except Exception as exc:
         return DatasetResult(
-            name=task.name,
-            log=f"{task.name}: ERROR {type(exc).__name__}: {exc}",
-            windows=[],
-            count=0,
-            success=False
+            name=task.name, log=f"{task.name}: ERROR {type(exc).__name__}: {exc}", windows=[], count=0, success=False
         )
 
 
 def main() -> None:
-    """
-    Generate uniformly sampled dataset windows from extracted rPPG signals.
-    """
+    """Generate uniformly sampled dataset windows from extracted rPPG signals."""
     # Parse arguments.
-    ap = argparse.ArgumentParser(
-        description=("Generate fixed-length training windows from extracted rPPG signals.")
-    )
+    ap = argparse.ArgumentParser(description=("Generate fixed-length training windows from extracted rPPG signals."))
     ap.add_argument("--signals-dir", default="output/signals")
     ap.add_argument("--ppg-dir", default="data/ppg")
     ap.add_argument("--ground-truth", default="data/ground_truth.csv")
     ap.add_argument("--out-dir", default="output/dataset")
-    ap.add_argument("--workers", type=int, default=0,
-        help="Number of worker processes (0 = all available cores)."
-    )
+    ap.add_argument("--workers", type=int, default=0, help="Number of worker processes (0 = all available cores).")
     args = ap.parse_args()
 
     # Create the output directory.
@@ -329,7 +317,9 @@ def main() -> None:
 
     # List available signal archives.
     signal_files: list[str] = sorted(
-        file for file in os.listdir(args.signals_dir) if file.endswith(FileExtension.SIGNALS) # type: ignore
+        file
+        for file in os.listdir(args.signals_dir)  # type: ignore
+        if file.endswith(FileExtension.SIGNALS)  # type: ignore
     )
     print(f"Loaded {len(signal_files)} signal archive(s)")
 
@@ -339,11 +329,7 @@ def main() -> None:
     for signal_file in signal_files:
         name = signal_file[:-extension_length]
         tasks.append(
-            DatasetTask(
-                name=name,
-                signal_path=os.path.join(args.signals_dir, signal_file),
-                output_dir=args.out_dir
-            )
+            DatasetTask(name=name, signal_path=os.path.join(args.signals_dir, signal_file), output_dir=args.out_dir)
         )
 
     # Exit if no signal archives are available.

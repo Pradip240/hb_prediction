@@ -1,4 +1,5 @@
-"""Dataset for training the hemoglobin regression model.
+"""
+Dataset for training the hemoglobin regression model.
 
 The prepared segment archives contain:
 
@@ -16,11 +17,11 @@ RGB colour, pulsatile amplitude, colour ratios, and region pixel-count
 quality.
 """
 
-import os
 import csv
+import os
 
-import torch
 import numpy as np
+import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 
@@ -30,7 +31,8 @@ from hb_model.features import extract_features, feature_names
 
 
 class HbDataset(Dataset[tuple[Tensor, Tensor]]):
-    """Dataset for hemoglobin regression.
+    """
+    Dataset for hemoglobin regression.
 
     Each sample returns:
         features: Engineered Hb features with shape (F,).
@@ -44,6 +46,18 @@ class HbDataset(Dataset[tuple[Tensor, Tensor]]):
     """
 
     def __init__(self, segments_dir: str, manifest: str, min_hb: float, max_hb: float) -> None:
+        """
+        Initialize the dataset and load or create its feature cache.
+
+        Args:
+            segments_dir: Directory containing the dataset segment files.
+            manifest: Path to the manifest containing segment paths and hemoglobin targets.
+            min_hb: Minimum inclusive hemoglobin value to include.
+            max_hb: Maximum inclusive hemoglobin value to include.
+
+        Raises:
+            FileNotFoundError: If the manifest file does not exist.
+        """
         super().__init__()
 
         self.segments_dir = segments_dir
@@ -63,11 +77,8 @@ class HbDataset(Dataset[tuple[Tensor, Tensor]]):
         self._load_samples()
         self._load_or_create_feature_cache()
 
-
     def _load_samples(self) -> None:
-        """
-        Load valid segment paths and hemoglobin labels.
-        """
+        """Load valid segment paths and hemoglobin labels."""
         with open(self.manifest, encoding="utf-8-sig", newline="") as file:
             reader = csv.DictReader(file)
             if reader.fieldnames is None:
@@ -99,7 +110,6 @@ class HbDataset(Dataset[tuple[Tensor, Tensor]]):
                     continue
 
                 self.samples.append((segment_path, hemoglobin))
-
 
     def _load_or_create_feature_cache(self) -> None:
         """
@@ -142,24 +152,14 @@ class HbDataset(Dataset[tuple[Tensor, Tensor]]):
             pixel_counts = np.asarray(data["pixel_counts"], dtype=np.float32)
             fps = float(data["fps"])
             if signals.ndim != 3:
-                raise ValueError(
-                    f"Expected signals with shape (T, R, 3), "
-                    f"got {signals.shape} in {path}."
-                )
+                raise ValueError(f"Expected signals with shape (T, R, 3), got {signals.shape} in {path}.")
             if signals.shape[-1] != 3:
-                raise ValueError(
-                    f"Expected RGB signals with 3 channels, "
-                    f"got {signals.shape[-1]} in {path}."
-                )
+                raise ValueError(f"Expected RGB signals with 3 channels, got {signals.shape[-1]} in {path}.")
             if pixel_counts.ndim != 2:
-                raise ValueError(
-                    f"Expected pixel_counts with shape (T, R), "
-                    f"got {pixel_counts.shape} in {path}."
-                )
+                raise ValueError(f"Expected pixel_counts with shape (T, R), got {pixel_counts.shape} in {path}.")
             if signals.shape[:2] != pixel_counts.shape:
                 raise ValueError(
-                    "signals and pixel_counts shapes do not match: "
-                    f"{signals.shape} vs {pixel_counts.shape}."
+                    f"signals and pixel_counts shapes do not match: {signals.shape} vs {pixel_counts.shape}."
                 )
 
             # The archive stores:
@@ -179,8 +179,7 @@ class HbDataset(Dataset[tuple[Tensor, Tensor]]):
                 raise ValueError(f"Non-finite Hb features generated for {path}.")
             if features.shape[0] != len(self.feature_names):
                 raise ValueError(
-                    "Feature count does not match feature names: "
-                    f"{features.shape[0]} vs {len(self.feature_names)}."
+                    f"Feature count does not match feature names: {features.shape[0]} vs {len(self.feature_names)}."
                 )
             features_list.append(features.astype(np.float32))
             targets_list.append(float(hemoglobin))
@@ -192,13 +191,9 @@ class HbDataset(Dataset[tuple[Tensor, Tensor]]):
         np.savez_compressed(cache_path, features=self.features, targets=self.targets)
         print(f"Saved Hb feature cache: {cache_path}")
 
-
     def __len__(self) -> int:
-        """
-        Return the number of valid training samples.
-        """
+        """Return the number of valid training samples."""
         return len(self.samples)
-
 
     def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
         """
@@ -214,11 +209,12 @@ class HbDataset(Dataset[tuple[Tensor, Tensor]]):
         """
         features = self.features[index]
         hemoglobin = self.targets[index]
-        return torch.from_numpy(features), torch.tensor(hemoglobin, dtype=torch.float32) # type: ignore
+        return torch.from_numpy(features), torch.tensor(hemoglobin, dtype=torch.float32)  # type: ignore
 
 
 def load_dataset(segments_dir: str, manifest: str) -> HbDataset:
-    """Create the hemoglobin training dataset.
+    """
+    Create the hemoglobin training dataset.
 
     Args:
         segments_dir: Directory containing prepared segment archives.

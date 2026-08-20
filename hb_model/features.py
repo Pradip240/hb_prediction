@@ -1,4 +1,5 @@
-"""Feature extraction for hemoglobin estimation.
+"""
+Feature extraction for hemoglobin estimation.
 
 Hemoglobin estimation is treated as a regression problem using
 physically motivated facial colour and pulsatile features.
@@ -34,11 +35,9 @@ The resulting feature vector is intentionally small and interpretable
 so that the Hb model has limited capacity to memorize subject identity.
 """
 
-
 import numpy as np
 
 from common import signal_processing as sp
-
 
 CHANNELS = ("R", "G", "B")
 
@@ -53,7 +52,8 @@ def _safe_ratio(numerator: float, denominator: float) -> float:
 
 
 def _ac_dc(x: np.ndarray, fps: float) -> tuple[float, float]:
-    """Calculate DC level and AC amplitude for one colour channel.
+    """
+    Calculate DC level and AC amplitude for one colour channel.
 
     Args:
         x: One-dimensional RGB signal.
@@ -91,7 +91,8 @@ def _ac_dc(x: np.ndarray, fps: float) -> tuple[float, float]:
 
 
 def _pixel_count_features(pixel_counts: np.ndarray) -> list[float]:
-    """Calculate region-level quality features from pixel counts.
+    """
+    Calculate region-level quality features from pixel counts.
 
     Args:
         pixel_counts: Pixel counts with shape (T,).
@@ -124,7 +125,8 @@ def _pixel_count_features(pixel_counts: np.ndarray) -> list[float]:
 
 
 def feature_names(region_order: list[str]) -> list[str]:
-    """Return feature names in the same order as extract_features().
+    """
+    Return feature names in the same order as extract_features().
 
     Args:
         region_order: Names of the facial regions.
@@ -137,36 +139,45 @@ def feature_names(region_order: list[str]) -> list[str]:
     for region_name in region_order:
         # RGB features.
         for channel in CHANNELS:
-            names.extend([
-                f"{region_name}_{channel}_dc",
-                f"{region_name}_{channel}_ac",
-                f"{region_name}_{channel}_acdc",
-            ])
+            names.extend(
+                [
+                    f"{region_name}_{channel}_dc",
+                    f"{region_name}_{channel}_ac",
+                    f"{region_name}_{channel}_acdc",
+                ]
+            )
         # Cross-channel AC/DC ratios.
-        names.extend([
-            f"{region_name}_acdc_G_over_R",
-            f"{region_name}_acdc_R_over_B",
-            f"{region_name}_acdc_G_over_B",
-        ])
+        names.extend(
+            [
+                f"{region_name}_acdc_G_over_R",
+                f"{region_name}_acdc_R_over_B",
+                f"{region_name}_acdc_G_over_B",
+            ]
+        )
         # DC colour balance.
-        names.extend([
-            f"{region_name}_dc_R_over_G",
-            f"{region_name}_dc_R_over_B",
-            f"{region_name}_dc_G_over_B",
-        ])
+        names.extend(
+            [
+                f"{region_name}_dc_R_over_G",
+                f"{region_name}_dc_R_over_B",
+                f"{region_name}_dc_G_over_B",
+            ]
+        )
         # Pixel-count / region-quality features.
-        names.extend([
-            f"{region_name}_pixels_mean",
-            f"{region_name}_pixels_std",
-            f"{region_name}_pixels_median",
-            f"{region_name}_pixels_detection_fraction",
-            f"{region_name}_pixels_normalized_mean",
-        ])
+        names.extend(
+            [
+                f"{region_name}_pixels_mean",
+                f"{region_name}_pixels_std",
+                f"{region_name}_pixels_median",
+                f"{region_name}_pixels_detection_fraction",
+                f"{region_name}_pixels_normalized_mean",
+            ]
+        )
     return names
 
 
 def extract_features(signals: np.ndarray, pixel_counts: np.ndarray, fps: float, region_order: list[str]) -> np.ndarray:
-    """Extract RGB and pixel-count features from one segment.
+    """
+    Extract RGB and pixel-count features from one segment.
 
     Args:
         signals: RGB signals with shape (R, T, 3).
@@ -209,17 +220,17 @@ def extract_features(signals: np.ndarray, pixel_counts: np.ndarray, fps: float, 
             acdcs.append(acdc)
             features.extend([dc, ac, acdc])
         # Cross-channel AC/DC ratios.
-        features.extend([
-            _safe_ratio(acdcs[1], acdcs[0]),
-            _safe_ratio(acdcs[0], acdcs[2]),
-            _safe_ratio(acdcs[1], acdcs[2])
-        ])
+        features.extend(
+            [_safe_ratio(acdcs[1], acdcs[0]), _safe_ratio(acdcs[0], acdcs[2]), _safe_ratio(acdcs[1], acdcs[2])]
+        )
         # DC colour ratios.
-        features.extend([
-            _safe_ratio(dcs[0], dcs[1]),
-            _safe_ratio(dcs[0], dcs[2]),
-            _safe_ratio(dcs[1], dcs[2]),
-        ])
+        features.extend(
+            [
+                _safe_ratio(dcs[0], dcs[1]),
+                _safe_ratio(dcs[0], dcs[2]),
+                _safe_ratio(dcs[1], dcs[2]),
+            ]
+        )
         # Add region detection and pixel-count quality features.
         features.extend(_pixel_count_features(pixel_counts[region_index]))
     return np.asarray(features, dtype=np.float32)

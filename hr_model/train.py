@@ -1,4 +1,5 @@
-"""Train HRSpectralNet on facial RGB signals and pixel-count features.
+"""
+Train HRSpectralNet on facial RGB signals and pixel-count features.
 
 The model input is constructed from the saved per-region signals:
     signals:      (T, R, 3)
@@ -31,26 +32,24 @@ Usage:
         --batch-size 128
 """
 
-import os
+import argparse
 import csv
 import json
-import argparse
+import os
 
-import tqdm
-import torch
 import numpy as np
+import torch
+import tqdm
 from torch.utils.data import DataLoader, Subset
 
 from common.data_types import FileExtension
-from hr_model.model import HRSpectralNet
 from hr_model.dataset import SpectralDataset, load_dataset
+from hr_model.model import HRSpectralNet
 from hr_model.visualize import plot_history
 
 
 def evaluate(
-    model: HRSpectralNet,
-    loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
-    device: torch.device
+    model: HRSpectralNet, loader: DataLoader[tuple[torch.Tensor, torch.Tensor]], device: torch.device
 ) -> tuple[float, float]:
     """
     Evaluate the model using mean absolute error.
@@ -117,7 +116,7 @@ def load_subjects(dataset: SpectralDataset) -> list[str]:
     subjects: list[str] = []
     # Keep patient IDs in the same order as dataset.samples.
     for segment_path, _ in dataset.samples:
-        segment_name = os.path.basename(segment_path)[:-len(FileExtension.DATASET_SAMPLE)]
+        segment_name = os.path.basename(segment_path)[: -len(FileExtension.DATASET_SAMPLE)]
         patient_id = subjects_by_segment.get(segment_name)
         if patient_id is None:
             raise ValueError(f"No patient_id found in manifest for segment: {segment_name}")
@@ -169,8 +168,8 @@ def split_subjects(
 
     # Assign subjects to each split.
     test_subjects = set(unique_subjects[:n_test])
-    val_subjects = set(unique_subjects[n_test:n_test + n_val])
-    train_subjects = set(unique_subjects[n_test + n_val:])
+    val_subjects = set(unique_subjects[n_test : n_test + n_val])
+    train_subjects = set(unique_subjects[n_test + n_val :])
 
     subject_array = np.asarray(subjects)
 
@@ -238,18 +237,18 @@ def train(
             predicted_bpm, logits, _ = model(signals)
             loss, _ = model.loss(predicted_bpm, logits, heart_rates)
             optimizer.zero_grad()
-            loss.backward() # type: ignore
-            optimizer.step() # type: ignore
+            loss.backward()  # type: ignore
+            optimizer.step()  # type: ignore
             batch_size = signals.shape[0]
             total_loss += loss.item() * batch_size
             sample_count += batch_size
             # Update the progress bar with the current batch loss.
-            progress.set_postfix(loss=f"{loss.item():.4f}") # type: ignore
+            progress.set_postfix(loss=f"{loss.item():.4f}")  # type: ignore
         train_loss = total_loss / max(1, sample_count)
 
         # Validation BPM accuracy is used for model selection.
         val_mae, val_within_6 = evaluate(model, val_loader, device)
-        scheduler.step(val_mae) # type: ignore
+        scheduler.step(val_mae)  # type: ignore
         current_lr = float(optimizer.param_groups[0]["lr"])
 
         # Always save the most recent model state.
@@ -266,9 +265,7 @@ def train(
         )
         # Save the history after every epoch so progress is not lost.
         with open(history_path, "w", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(
-                file, fieldnames=["epoch", "train_loss", "val_mae", "val_within_6", "lr"]
-            )
+            writer = csv.DictWriter(file, fieldnames=["epoch", "train_loss", "val_mae", "val_within_6", "lr"])
             writer.writeheader()
             writer.writerows(history)
 
@@ -309,12 +306,8 @@ def train(
 
 
 def main() -> None:
-    """
-    Train and evaluate HRSpectralNet.
-    """
-    parser = argparse.ArgumentParser(
-        description="Train spectral HR model on facial RGB + pixel-count segments."
-    )
+    """Train and evaluate HRSpectralNet."""
+    parser = argparse.ArgumentParser(description="Train spectral HR model on facial RGB + pixel-count segments.")
     parser.add_argument("--segments-dir", default="output/dataset")
     parser.add_argument("--manifest", default="output/dataset/segments_manifest.csv")
     parser.add_argument("--out-dir", default="output/hr_model")
@@ -331,7 +324,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # Reproducibility.
-    torch.manual_seed(args.seed) # type: ignore
+    torch.manual_seed(args.seed)  # type: ignore
     np.random.seed(args.seed)
     device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_name)
@@ -367,19 +360,19 @@ def main() -> None:
         Subset(dataset, train_indices.tolist()),
         batch_size=args.batch_size,
         shuffle=True,
-        pin_memory=device.type == "cuda"
+        pin_memory=device.type == "cuda",
     )
     val_loader = DataLoader(
         Subset(dataset, val_indices.tolist()),
         batch_size=args.batch_size,
         shuffle=False,
-        pin_memory=device.type == "cuda"
+        pin_memory=device.type == "cuda",
     )
     test_loader = DataLoader(
         Subset(dataset, test_indices.tolist()),
         batch_size=args.batch_size,
         shuffle=False,
-        pin_memory=device.type == "cuda"
+        pin_memory=device.type == "cuda",
     )
 
     # Create Model
@@ -431,12 +424,12 @@ def main() -> None:
                 "test_ratio": args.test_ratio,
                 "n_channels": n_channels,
                 "nfft": model.nfft,
-                "hr_min": float(model.band_bpm[0].item()), # type: ignore
-                "hr_max": float(model.band_bpm[-1].item()), # type: ignore
+                "hr_min": float(model.band_bpm[0].item()),  # type: ignore
+                "hr_max": float(model.band_bpm[-1].item()),  # type: ignore
                 "seed": args.seed,
             },
             file,
-            indent=2
+            indent=2,
         )
 
     # Save model configuration
@@ -447,12 +440,12 @@ def main() -> None:
                 "n_channels": n_channels,
                 "fps": model.fps,
                 "nfft": model.nfft,
-                "hr_min": float(model.band_bpm[0].item()), # type: ignore
-                "hr_max": float(model.band_bpm[-1].item()), # type: ignore
+                "hr_min": float(model.band_bpm[0].item()),  # type: ignore
+                "hr_max": float(model.band_bpm[-1].item()),  # type: ignore
                 "input_layout": "(B, R*4, T)",
             },
             file,
-            indent=2
+            indent=2,
         )
 
     # Generate training and test plots
