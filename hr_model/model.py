@@ -1,29 +1,24 @@
 """
-Spectral CNN for heart-rate estimation from facial RGB signals.
+Two-branch CNN for heart-rate estimation from facial RGB signals.
 
-HRSpectralNet estimates heart rate directly from the frequency-domain
-representation of per-region RGB signals.
+HRSpectralNet estimates heart rate from per-region RGB signals using two
+complementary views of the same input:
 
-Processing pipeline:
+1. A spectral branch that operates on the band-limited log-power spectrum and
+   learns which spectral peaks correspond to cardiac activity.
+2. A temporal branch that operates directly on the raw time-domain waveform and
+   learns pulse morphology, such as the systolic upstroke and beat-to-beat
+   spacing, which helps distinguish a true fundamental from a sub-harmonic even
+   when the spectral peak is weak.
 
-1. Convert each input channel from the time domain to log-power spectra.
-2. Restrict the spectra to the configured physiological HR range.
-3. Normalize each channel independently across frequency.
-4. Use a 1-D CNN across frequency to learn which spectral peaks are
-   associated with cardiac activity.
-5. Apply a softmax over the HR-frequency bins.
-6. Compute a differentiable local soft-argmax around the dominant peak to
-   obtain a continuous HR estimate.
+The two branches are fused and projected onto the HR-frequency grid. Prediction
+uses a differentiable local soft-argmax around the dominant peak so the readout
+commits to a single spectral mode rather than averaging across competing peaks.
 
 The training objective combines:
 - Smooth-L1 regression loss on the predicted heart rate.
 - Soft cross-entropy against a Gaussian distribution centered on the
   ground-truth heart rate.
-
-The Gaussian target encourages the predicted spectral distribution to
-concentrate around the true heart rate while the local soft-argmax provides a
-continuous BPM prediction that commits to a single spectral peak rather than
-averaging across competing peaks.
 """
 
 import numpy as np
@@ -42,8 +37,10 @@ class HRSpectralNet(nn.Module):
         nfft: int = 2048,
         hr_min: float = 40.0,
         hr_max: float = 200.0,
-        width: int = 64,
+        width: int = 96,
         readout_halfwidth_bpm: float = 12.0,
+        dropout: float = 0.3,
+        augment: bool = True,
     ) -> None:
         """
         Initialize the spectral HR model.
@@ -57,6 +54,10 @@ class HRSpectralNet(nn.Module):
             width: Number of feature channels used by the convolutional network.
             readout_halfwidth_bpm: Half-width in BPM of the window used by the
                 local soft-argmax readout around the dominant spectral peak.
+            dropout: Dropout probability applied within both branches and the
+                fusion head to reduce overfitting to subject-specific detail.
+            augment: Whether to apply light waveform augmentation during
+                training only. Augmentation is disabled automatically in eval.
         """
         super().__init__()
 
@@ -75,6 +76,7 @@ class HRSpectralNet(nn.Module):
         self.fps = float(fps)
         self.nfft = int(nfft)
         self.readout_halfwidth_bpm = float(readout_halfwidth_bpm)
+        self.augment = bool(augment)
 
         # Build the FFT frequency grid and keep only the configured HR band.
         frequencies = np.fft.rfftfreq(self.nfft, d=1.0 / self.fps)
@@ -91,19 +93,84 @@ class HRSpectralNet(nn.Module):
 
         self.n_freq = len(band_indices)
 
-        # Convolutional network operating along the frequency dimension.
-        self.net = nn.Sequential(
+        # Spectral branch: 1-D convolutions along the frequency axis.
+        self.spectral_net = nn.Sequential(
             nn.Conv1d(n_channels, width, kernel_size=5, padding=2),
             nn.BatchNorm1d(width),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Conv1d(width, width, kernel_size=5, padding=2),
             nn.BatchNorm1d(width),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Conv1d(width, width, kernel_size=5, padding=2),
             nn.BatchNorm1d(width),
             nn.GELU(),
+        )
+
+        # Temporal branch: strided 1-D convolutions along the time axis.
+        self.temporal_net = nn.Sequential(
+            nn.Conv1d(n_channels, width, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm1d(width),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(width, width, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm1d(width),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(width, width, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm1d(width),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(1),
+        )
+
+        # Fusion head: combine the temporal descriptor with the spectral features
+        # at every frequency bin, then score each bin for pulse likelihood.
+        self.fusion = nn.Sequential(
+            nn.Conv1d(width * 2, width, kernel_size=1),
+            nn.BatchNorm1d(width),
+            nn.GELU(),
+            nn.Dropout(dropout),
             nn.Conv1d(width, 1, kernel_size=1),
         )
+
+    def _augment_waveform(self, signal: Tensor) -> Tensor:
+        """
+        Apply light label-preserving augmentation to the raw waveform.
+
+        Augmentation runs only in training mode. None of the transforms change
+        the underlying heart rate, so the regression and distribution targets
+        remain valid. The transforms discourage the temporal branch from
+        memorizing subject-specific amplitude, phase, and per-region detail.
+
+        Args:
+            signal: Input signals with shape (B, C, T).
+
+        Returns:
+            Augmented signals with shape (B, C, T).
+        """
+        if not (self.training and self.augment):
+            return signal
+
+        batch, channels, _ = signal.shape
+
+        # Per-channel amplitude jitter.
+        signal = signal * (1.0 + 0.1 * torch.randn(batch, channels, 1, device=signal.device, dtype=signal.dtype))
+
+        # Additive Gaussian noise.
+        signal = signal + 0.05 * torch.randn_like(signal)
+
+        # Circular time shift preserves periodicity and therefore the heart rate.
+        shift = int(torch.randint(-15, 16, (1,)).item())
+        signal = torch.roll(signal, shifts=shift, dims=-1)
+
+        # Occasionally drop one facial region's four channels to encourage the
+        # model to rely on multiple regions rather than a single one.
+        if channels >= 4 and torch.rand(1).item() < 0.3:
+            region = int(torch.randint(0, channels // 4, (1,)).item())
+            signal = signal.clone()
+            signal[:, region * 4 : (region + 1) * 4, :] = 0.0
+        return signal
 
     def spectral_input(self, signal: Tensor) -> Tensor:
         """
@@ -145,12 +212,10 @@ class HRSpectralNet(nn.Module):
         """
         Estimate a continuous HR by soft-argmax around the dominant peak.
 
-        A global soft-argmax computes the expectation over the entire HR band.
-        When the spectral distribution is multi-modal, for example when a strong
-        sub-harmonic competes with the true pulse peak, that expectation falls in
-        the empty valley between the peaks and is wrong for both. Restricting the
-        expectation to a narrow window around the highest-probability bin lets the
-        readout commit to a single peak while remaining differentiable.
+        Restricting the expectation to a narrow window around the highest
+        probability bin lets the readout commit to a single spectral mode rather
+        than averaging across competing peaks, which would otherwise place the
+        estimate in the empty valley between a sub-harmonic and the true pulse.
 
         Args:
             probability: Spectral probabilities with shape (B, F).
@@ -162,8 +227,7 @@ class HRSpectralNet(nn.Module):
         peak_index = torch.argmax(probability, dim=-1)
         peak_bpm = self.band_bpm[peak_index]  # type: ignore
 
-        # Build a soft window around each peak so bins far from the peak do not
-        # contribute to the expectation.
+        # Build a soft window around each peak so distant bins do not contribute.
         distance = (self.band_bpm[None, :] - peak_bpm[:, None]).abs()  # type: ignore
         window = (distance <= self.readout_halfwidth_bpm).to(probability.dtype) # type: ignore
 
@@ -188,10 +252,20 @@ class HRSpectralNet(nn.Module):
                 - Spectral logits with shape (B, F).
                 - Spectral probabilities with shape (B, F).
         """
-        spectrum = self.spectral_input(signal)
+        # Apply training-only waveform augmentation before both branches.
+        signal = self._augment_waveform(signal)
 
-        # Learn a pulse-likelihood score for every HR frequency bin.
-        logits = self.net(spectrum).squeeze(1)
+        # Spectral branch over the band-limited power spectrum.
+        spectrum = self.spectral_input(signal)
+        spectral_features = self.spectral_net(spectrum)  # (B, width, F)
+
+        # Temporal branch over the raw waveform, broadcast across frequency bins.
+        temporal_descriptor = self.temporal_net(signal)  # (B, width, 1)
+        temporal_features = temporal_descriptor.expand(-1, -1, self.n_freq)  # (B, width, F)
+
+        # Fuse the two views and score every HR frequency bin.
+        fused = torch.cat([spectral_features, temporal_features], dim=1)  # (B, 2*width, F)
+        logits = self.fusion(fused).squeeze(1)  # (B, F)
 
         # Convert spectral scores into a probability distribution.
         probability = torch.softmax(logits, dim=-1)

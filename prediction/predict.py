@@ -291,7 +291,7 @@ def main() -> None:
     predictions.sort(key=lambda result: result.prediction.segment if result.prediction else result.name)
 
     # Save prediction results to CSV
-    csv_path = os.path.join(args.out_dir, "hr_results.csv")
+    csv_path = os.path.join(args.out_dir, "results.csv")
     field_names = [field.name for field in fields(PredictionRecord)]
     with open(csv_path, "w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=field_names)

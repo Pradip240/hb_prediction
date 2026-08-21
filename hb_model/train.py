@@ -183,6 +183,34 @@ def standardize_features(train_features: np.ndarray, features: np.ndarray) -> np
     return (features - mean) / std
 
 
+def criterion(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Computes a regression loss with a penalty for mismatched prediction spread.
+
+    Args:
+        predicted: Predicted values from the model.
+        target: Ground-truth target values with the same shape as `predicted`.
+
+    Returns:
+        A scalar loss equal to the Smooth L1 loss plus 0.3 times the absolute
+        difference between the prediction and target standard deviations.
+
+    Note:
+        When `predicted` contains only one element, the spread penalty is zero
+        because the standard deviation is not meaningful for a single value.
+    """
+    base = torch.nn.functional.smooth_l1_loss(predicted, target)
+
+    # Penalize under-dispersion: encourage the batch spread of predictions
+    # to match the spread of targets, counteracting regression to the mean.
+    if predicted.numel() > 1:
+        spread_penalty = (predicted.std() - target.std()).abs()
+    else:
+        spread_penalty = torch.zeros((), device=predicted.device)
+
+    return base + 0.3 * spread_penalty
+
+
 def train(
     model: HbMLP,
     train_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
@@ -217,7 +245,6 @@ def train(
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
-    criterion = torch.nn.SmoothL1Loss()
 
     best_val_mae = float("inf")
     best_state: dict[str, torch.Tensor] | None = None
@@ -241,7 +268,7 @@ def train(
             predicted = model(features)
             loss = criterion(predicted, hemoglobin)
             optimizer.zero_grad()
-            loss.backward()
+            loss.backward() # type: ignore
             optimizer.step()  # type: ignore
             batch_size = features.shape[0]
             total_loss += loss.item() * batch_size

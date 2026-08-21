@@ -32,7 +32,7 @@ class HbMLP(nn.Module):
         A scalar hemoglobin prediction for each input sample.
     """
 
-    def __init__(self, n_in: int, width: int = 512, dropout: float = 0.3) -> None:
+    def __init__(self, n_in: int, width: int = 128, dropout: float = 0.3) -> None:
         """
         Initialize the feed-forward regression network.
 

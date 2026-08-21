@@ -41,17 +41,18 @@ def plot_segment(
     """
     # Build the time axis for the uniformly sampled RGB signals.
     n_frames = signals.shape[0]
-    time = np.arange(n_frames) / fps # type: ignore
-    fig, axes = plt.subplots(5, 1, figsize=(12, 13), sharex=False) # type: ignore
+    time = np.arange(n_frames) / fps  # type: ignore
+    fig, axes = plt.subplots(5, 1, figsize=(12, 13), sharex=False)  # type: ignore
 
     # Plot the extracted pulse waveforms and their HR estimates.
     for axis, method in zip(axes[0:3], ("POS", "CHROM", "green")):
         waveform = np.asarray(waveforms[method].waveform, dtype=np.float64)
         waveform = (waveform - np.nanmean(waveform)) / (np.nanstd(waveform) + 1e-9)
-        axis.plot(time[:len(waveform)], waveform, color=config.RPPG_METHOD_COLORS[method], linewidth=0.9)
+        axis.plot(time[: len(waveform)], waveform, color=config.RPPG_METHOD_COLORS[method], linewidth=0.9)
         hr_text = (
             f"{waveforms[method].heart_rate:.1f} BPM (conf {waveforms[method].confidence:.0f})"
-            if waveforms[method].heart_rate is not None else "no peak"
+            if waveforms[method].heart_rate is not None
+            else "no peak"
         )
         axis.set_ylabel(f"{method}\n{hr_text}")
         axis.grid(alpha=0.3)
@@ -67,8 +68,15 @@ def plot_segment(
     elif task.hr_true is not None:
         text = f"HR ground truth (from CSV): {task.hr_true:.0f} BPM"
         axes[3].text(
-            0.5, 0.5, text, ha="center", va="center", transform=axes[3].transAxes,
-            fontsize=12, fontweight="bold", color="crimson"
+            0.5,
+            0.5,
+            text,
+            ha="center",
+            va="center",
+            transform=axes[3].transAxes,
+            fontsize=12,
+            fontweight="bold",
+            color="crimson",
         )
         axes[3].set_ylabel("HR label\n(pulse)")
         axes[3].set_xticks([])
@@ -91,8 +99,14 @@ def plot_segment(
         axes[4].grid(alpha=0.3)
     else:
         axes[4].text(
-            0.5, 0.5, "Trained model (pending)", ha="center", va="center", transform=axes[4].transAxes,
-            color="gray", style="italic"
+            0.5,
+            0.5,
+            "Trained model (pending)",
+            ha="center",
+            va="center",
+            transform=axes[4].transAxes,
+            color="gray",
+            style="italic",
         )
         axes[4].set_ylabel("model")
         axes[4].set_xlabel("HR (BPM)")
@@ -118,9 +132,9 @@ def plot_segment(
     elif task.hb_true is not None:
         title += f"   |   Hb: {task.hb_true:.2f} g/dL GT"
 
-    fig.suptitle(title, fontweight="bold") # type: ignore
-    plt.tight_layout(rect=[0, 0, 1, 0.99]) # type: ignore
-    plt.savefig(output_path, dpi=120) # type: ignore
+    fig.suptitle(title, fontweight="bold")  # type: ignore
+    plt.tight_layout(rect=[0, 0, 1, 0.99])  # type: ignore
+    plt.savefig(output_path, dpi=120)  # type: ignore
     plt.close()
 
 
@@ -136,7 +150,7 @@ def write_accuracy_plot(rows: list[dict[str, str]], out_dir: str) -> str | None:
         Path to the generated plot, or None when there are too few
         labeled segments.
     """
-    lab = np.array([float(row["hr_label"]) for row in rows ])
+    lab = np.array([float(row["hr_label"]) for row in rows])
     if np.isfinite(lab).sum() < 5:
         print("  (accuracy plot skipped: fewer than 5 labeled segments)")
         return None
@@ -155,10 +169,10 @@ def write_accuracy_plot(rows: list[dict[str, str]], out_dir: str) -> str | None:
     finite_labels = lab[np.isfinite(lab)]
     limits: list[float] = [
         max(30, np.floor(finite_labels.min() / 10) * 10 - 5),
-        np.ceil(finite_labels.max() / 10) * 10 + 5
+        np.ceil(finite_labels.max() / 10) * 10 + 5,
     ]
     n_panels = len(panels)
-    fig, axes = plt.subplots(1, n_panels, figsize=(5.3 * n_panels, 5.4)) # type: ignore
+    fig, axes = plt.subplots(1, n_panels, figsize=(5.3 * n_panels, 5.4))  # type: ignore
 
     if n_panels == 1:
         axes = [axes]
@@ -173,18 +187,20 @@ def write_accuracy_plot(rows: list[dict[str, str]], out_dir: str) -> str | None:
 
         if confidence_column is not None:
             confidence = np.array([float(row.get(confidence_column)) for row in rows])
-            threshold = 10
-            if confidence_column == "hr_pred_conf":
-                threshold = 0.2
+            threshold = float(np.nanmedian(confidence[valid]))
             high_conf = valid & (confidence >= threshold)
             low_conf = valid & (confidence < threshold)
             axis.scatter(
-                lab[low_conf], hr[low_conf], s=10, facecolors="none", edgecolors="#bbbbbb",
-                linewidths=0.6, label=f"low conf (<{threshold:.2f})"
+                lab[low_conf],
+                hr[low_conf],
+                s=10,
+                facecolors="none",
+                edgecolors="#bbbbbb",
+                linewidths=0.6,
+                label=f"low conf (<{threshold:.2f})",
             )
             axis.scatter(
-                lab[high_conf], hr[high_conf], s=12, alpha=0.5,
-                color="#1f77b4", label=f"high conf (≥{threshold:.2f})"
+                lab[high_conf], hr[high_conf], s=12, alpha=0.5, color="#1f77b4", label=f"high conf (≥{threshold:.2f})"
             )
         else:
             axis.scatter(lab[valid], hr[valid], s=12, alpha=0.5, color="purple", label="model")
@@ -196,14 +212,12 @@ def write_accuracy_plot(rows: list[dict[str, str]], out_dir: str) -> str | None:
         within_6 = np.mean(absolute_error[valid] <= 6) * 100
         extra = ""
 
-        if confidence_column is not None:
-            confidence = np.array([float(row.get(confidence_column)) for row in rows])
-            high_conf = valid & (confidence >= np.nanmedian(confidence[valid]))
-            if high_conf.any():
-                extra = (
-                    f"  |  hi-conf: MAE {np.nanmean(absolute_error[high_conf]):.1f}, "
-                    f"w6 {np.mean(absolute_error[high_conf] <= 6) * 100:.0f}%"
-                )
+        if confidence_column is not None and high_conf.any():
+            coverage = 100 * high_conf.sum() / valid.sum()
+            extra = (
+                f"  |  hi-conf: MAE {np.nanmean(absolute_error[high_conf]):.1f}, "
+                f"w6 {np.mean(absolute_error[high_conf] <= 6) * 100:.0f}%"
+            )
 
         axis.set_title(f"{name}\nMAE {mae:.1f}, bias {bias:+.1f}, w6 {within_6:.0f}%{extra}", fontsize=10)
         axis.set_xlabel("GT label HR (BPM)")
@@ -214,9 +228,10 @@ def write_accuracy_plot(rows: list[dict[str, str]], out_dir: str) -> str | None:
 
     axes[0].set_ylabel("predicted HR (BPM)")
     fig.suptitle(
-        f"HR accuracy on GT label — {int(np.isfinite(lab).sum())} labeled segments"
-        + "  (incl. trained model)" if has_model else "",
-        fontweight="bold"
+        f"HR accuracy on GT label — {int(np.isfinite(lab).sum())} labeled segments" + "  (incl. trained model)"
+        if has_model
+        else "",
+        fontweight="bold",
     )
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     output_path = f"{out_dir}/hr_accuracy.png"
@@ -240,8 +255,10 @@ def write_hb_accuracy_plot(rows: list[dict[str, str]], out_dir: str) -> str | No
         Path to the generated plot, or None when there are too few
         valid predictions.
     """
-    predicted = np.array([float(row.get("hb_pred")) for row in rows])
-    true = np.array([float(row.get("hb_label")) for row in rows])
+    predicted = np.array(
+        [float(row.get("hb_pred")) if row.get("hb_pred") not in (None, "") else np.nan for row in rows]
+    )
+    true = np.array([float(row.get("hb_label")) if row.get("hb_label") not in (None, "") else np.nan for row in rows])
     valid = np.isfinite(predicted) & np.isfinite(true)
 
     if valid.sum() < 5:
@@ -249,13 +266,16 @@ def write_hb_accuracy_plot(rows: list[dict[str, str]], out_dir: str) -> str | No
         return None
 
     # Aggregate segment predictions by subject.
-    subjects = np.array([
-        (
-            re.match(r"(\d+)", row.get("clip", "") or row.get("segment", "")).group(1)
-            if re.match(r"(\d+)", row.get("clip", "") or row.get("segment", "")) else "?"
-        )
-        for row in rows
-    ])
+    subjects = np.array(
+        [
+            (
+                re.match(r"(\d+)", row.get("clip", "") or row.get("segment", "")).group(1)
+                if re.match(r"(\d+)", row.get("clip", "") or row.get("segment", ""))
+                else "?"
+            )
+            for row in rows
+        ]
+    )
 
     subject_predictions: dict[str, list[float]] = {}
     subject_truth: dict[str, float] = {}
@@ -314,15 +334,14 @@ def write_hb_accuracy_plot(rows: list[dict[str, str]], out_dir: str) -> str | No
         f"r {segment_r:.2f}, "
         f"R² {segment_r2:.2f}  "
         f"(n={int(valid.sum())})",
-        fontsize=9
+        fontsize=9,
     )
     axes[0].legend(fontsize=8, loc="upper left")
     axes[0].grid(alpha=0.3)
 
     # Per-subject plot.
     axes[1].scatter(
-        subject_true, subject_pred, s=40, alpha=0.7, color="#9467bd",
-        edgecolors="k", linewidths=0.5, label="subject"
+        subject_true, subject_pred, s=40, alpha=0.7, color="#9467bd", edgecolors="k", linewidths=0.5, label="subject"
     )
     axes[1].plot(limits, limits, "k--", lw=1)
     axes[1].set_xlim(limits)
@@ -340,7 +359,7 @@ def write_hb_accuracy_plot(rows: list[dict[str, str]], out_dir: str) -> str | No
         f"r {subject_r:.2f}, "
         f"R² {subject_r2:.2f}  "
         f"({len(subject_ids)} subjects)",
-        fontsize=9
+        fontsize=9,
     )
     axes[1].legend(fontsize=8, loc="upper left")
     axes[1].grid(alpha=0.3)
