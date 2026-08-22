@@ -73,42 +73,39 @@ services:
   #             "--segments-dir", "/output/dataset", "--manifest", "/output/dataset/segments_manifest.csv",
   #             "--epochs", "120", "--batch-size", "256"]
 
-  hb_training:
-    image: rppg-base
-    container_name: hb-training
-    volumes:
-      - ./data:/data:ro
-      - ./output:/output
-      - ./common:/app/common:ro
-      - ./hb_model:/app/hb_model:ro
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    command: ["python", "-m", "hb_model.train", "--out-dir", "/output/hb_model",
-              "--segments-dir", "/output/dataset", "--manifest", "/output/dataset/segments_manifest.csv",
-              "--epochs", "120", "--batch-size", "256"]
-
-  # rppg_prediction:
+  # hb_training:
   #   image: rppg-base
-  #   container_name: rppg-prediction
-  #   working_dir: /app
+  #   container_name: hb-training
   #   volumes:
   #     - ./data:/data:ro
   #     - ./output:/output
   #     - ./common:/app/common:ro
-  #     - ./prediction:/app/prediction:ro
-  #     - ./hr_model:/app/hr_model:ro
   #     - ./hb_model:/app/hb_model:ro
-  #   command: ["python", "-m", "prediction.predict", "--dataset-dir", "/output/dataset", "--ppg-dir", "/data/ppg",
-  #             "--manifest", "/output/dataset/segments_manifest.csv", "--out-dir", "/output/prediction",
-  #             "--hr-model", "/output/hr_model", "--hb-model", "/output/hb_model", "--no-plot", "--workers", "1"]
-  #   # command: ["python", "-m", "prediction.predict", "--dataset-dir", "/output/dataset_icu", "--ppg-dir", "/data/ppg",
-  #   #           "--manifest", "/output/dataset_icu/segments_manifest.csv", "--out-dir", "/output/prediction_icu",
-  #   #           "--hr-model", "/output/hr_model", "--hb-model", "/output/hb_model", "--workers", "1"]
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
+  #   command: ["python", "-m", "hb_model.train", "--out-dir", "/output/hb_model",
+  #             "--segments-dir", "/output/dataset", "--manifest", "/output/dataset/segments_manifest.csv",
+  #             "--epochs", "120", "--batch-size", "256"]
+
+  rppg_prediction:
+    image: rppg-base
+    container_name: rppg-prediction
+    working_dir: /app
+    volumes:
+      - ./data:/data:ro
+      - ./output:/output
+      - ./common:/app/common:ro
+      - ./prediction:/app/prediction:ro
+      - ./hr_model:/app/hr_model:ro
+      - ./hb_model:/app/hb_model:ro
+    command: ["python", "-m", "prediction.predict", "--dataset-dir", "/output/dataset", "--ppg-dir", "/data/ppg",
+              "--manifest", "/output/dataset/segments_manifest.csv", "--out-dir", "/output/prediction",
+              "--hr-model", "/output/hr_model", "--hb-model", "/output/hb_model", "--no-plot", "--workers", "1"]
 
 #   docker compose run --rm segmentation
 #   docker compose run --rm landmarks

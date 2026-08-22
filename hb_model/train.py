@@ -45,7 +45,7 @@ from hb_model.visualization import plot_history
 
 def evaluate(
     model: HbMLP, loader: DataLoader[tuple[torch.Tensor, torch.Tensor]], device: torch.device
-) -> tuple[float, float]:
+) -> tuple[float, float, float, float]:
     """
     Evaluate the Hb model.
 
@@ -58,6 +58,10 @@ def evaluate(
         Tuple containing:
             - Mean absolute error in g/dL.
             - Root mean squared error in g/dL.
+            - Coefficient of determination (R²), measuring the proportion
+              of variance in hemoglobin values explained by the model.
+            - Pearson correlation coefficient between predicted and
+              target hemoglobin values.
     """
     model.eval()
 
@@ -72,14 +76,24 @@ def evaluate(
             targets.append(hemoglobin.numpy())
 
     if not predictions:
-        return float("nan"), float("nan")
+        return float("nan"), float("nan"), float("nan"), float("nan")
 
     predicted = np.concatenate(predictions)
     target = np.concatenate(targets)
     error = predicted - target
     mae = float(np.mean(np.abs(error)))
     rmse = float(np.sqrt(np.mean(error**2)))
-    return mae, rmse
+    # R2 and correlation quantify how much Hb variance is explained, which is
+    # the primary objective when optimizing for explainability.
+    ss_res = float(np.sum(error**2))
+    ss_tot = float(np.sum((target - np.mean(target)) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else float("nan")
+    corr = (
+        float(np.corrcoef(predicted, target)[0, 1])
+        if predicted.std() > 1e-12 and target.std() > 1e-12
+        else float("nan")
+    )
+    return mae, rmse, r2, corr
 
 
 def load_subjects(dataset: HbDataset) -> list[str]:
@@ -183,32 +197,59 @@ def standardize_features(train_features: np.ndarray, features: np.ndarray) -> np
     return (features - mean) / std
 
 
+# def criterion(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+#     """
+#     Computes a regression loss with a penalty for mismatched prediction spread.
+
+#     Args:
+#         predicted: Predicted values from the model.
+#         target: Ground-truth target values with the same shape as `predicted`.
+
+#     Returns:
+#         A scalar loss equal to the Smooth L1 loss plus 0.3 times the absolute
+#         difference between the prediction and target standard deviations.
+
+#     Note:
+#         When `predicted` contains only one element, the spread penalty is zero
+#         because the standard deviation is not meaningful for a single value.
+#     """
+#     base = torch.nn.functional.smooth_l1_loss(predicted, target)
+#     # Penalize under-dispersion: encourage the batch spread of predictions
+#     # to match the spread of targets, counteracting regression to the mean.
+#     if predicted.numel() > 1:
+#         spread_penalty = (predicted.std() - target.std()).abs()
+#     else:
+#         spread_penalty = torch.zeros((), device=predicted.device)
+#     return base + 0.3 * spread_penalty
+
+
 def criterion(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """
-    Computes a regression loss with a penalty for mismatched prediction spread.
+    Compute a correlation-based loss with an MSE scale anchor.
 
     Args:
-        predicted: Predicted values from the model.
-        target: Ground-truth target values with the same shape as `predicted`.
+        predicted: Model predictions for hemoglobin (Hb), typically one value
+            per subject.
+        target: Ground-truth hemoglobin (Hb) values corresponding to
+            ``predicted``.
 
     Returns:
-        A scalar loss equal to the Smooth L1 loss plus 0.3 times the absolute
-        difference between the prediction and target standard deviations.
-
-    Note:
-        When `predicted` contains only one element, the spread penalty is zero
-        because the standard deviation is not meaningful for a single value.
+        A scalar tensor containing ``1 - Pearson correlation`` plus a
+        weighted MSE term. The correlation component encourages tracking
+        relative variation across subjects, while the MSE term helps keep
+        predictions on the correct scale and in the correct units.
     """
-    base = torch.nn.functional.smooth_l1_loss(predicted, target)
+    if predicted.numel() < 2:
+        return torch.nn.functional.mse_loss(predicted, target)
 
-    # Penalize under-dispersion: encourage the batch spread of predictions
-    # to match the spread of targets, counteracting regression to the mean.
-    if predicted.numel() > 1:
-        spread_penalty = (predicted.std() - target.std()).abs()
-    else:
-        spread_penalty = torch.zeros((), device=predicted.device)
+    pred_c = predicted - predicted.mean()
+    targ_c = target - target.mean()
 
-    return base + 0.3 * spread_penalty
+    # Negative Pearson correlation (minimize -> maximize correlation)
+    corr = (pred_c * targ_c).sum() / (pred_c.norm() * targ_c.norm() + 1e-8)  # type: ignore
+
+    # Small MSE anchor keeps predictions on the right scale/units
+    return (1.0 - corr) + 0.1 * torch.nn.functional.mse_loss(predicted, target)  # type: ignore
 
 
 def train(
@@ -268,7 +309,7 @@ def train(
             predicted = model(features)
             loss = criterion(predicted, hemoglobin)
             optimizer.zero_grad()
-            loss.backward() # type: ignore
+            loss.backward()  # type: ignore
             optimizer.step()  # type: ignore
             batch_size = features.shape[0]
             total_loss += loss.item() * batch_size
@@ -277,7 +318,7 @@ def train(
             progress.set_postfix(loss=f"{loss.item():.4f}")  # type: ignore
 
         train_loss = total_loss / max(1, sample_count)
-        val_mae, val_rmse = evaluate(model, val_loader, device)
+        val_mae, val_rmse, val_r2, val_corr = evaluate(model, val_loader, device)
         scheduler.step(val_mae)  # type: ignore
         current_lr = float(optimizer.param_groups[0]["lr"])
 
@@ -288,12 +329,16 @@ def train(
                 "train_loss": train_loss,
                 "val_mae": val_mae,
                 "val_rmse": val_rmse,
+                "val_r2": val_r2,
+                "val_corr": val_corr,
                 "lr": current_lr,
             }
         )
 
         with open(history_path, "w", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=["epoch", "train_loss", "val_mae", "val_rmse", "lr"])
+            writer = csv.DictWriter(
+                file, fieldnames=["epoch", "train_loss", "val_mae", "val_rmse", "val_r2", "val_corr", "lr"]
+            )
             writer.writeheader()
             writer.writerows(history)
 
@@ -315,6 +360,7 @@ def train(
             f"loss={train_loss:.4f} "
             f"val_mae={val_mae:.3f} g/dL "
             f"val_rmse={val_rmse:.3f} g/dL "
+            f"val_r2={val_r2:.3f} "
             f"lr={current_lr:.2e}"
             f"{tag}"
         )
@@ -429,11 +475,13 @@ def main() -> None:
     )
 
     # Final test evaluation
-    test_mae, test_rmse = evaluate(model, test_loader, device)
+    test_mae, test_rmse, test_r2, test_corr = evaluate(model, test_loader, device)
     print()
     print("=== Test results ===")
     print(f"MAE:  {test_mae:.3f} g/dL")
     print(f"RMSE: {test_rmse:.3f} g/dL")
+    print(f"R2:   {test_r2:.3f}")
+    print(f"corr: {test_corr:.3f}")
 
     # Save final metrics.
     metrics_path = os.path.join(args.out_dir, "metrics.json")
@@ -443,6 +491,8 @@ def main() -> None:
                 "best_val_mae": min(entry["val_mae"] for entry in history if np.isfinite(entry["val_mae"])),
                 "test_mae": test_mae,
                 "test_rmse": test_rmse,
+                "test_r2": test_r2,
+                "test_corr": test_corr,
                 "train_samples": len(train_indices),
                 "val_samples": len(val_indices),
                 "test_samples": len(test_indices),
@@ -458,12 +508,15 @@ def main() -> None:
 
     # Save model configuration.
     config_path = os.path.join(args.out_dir, "model_config.json")
+    # Read architecture directly from the model.
+    hidden_width = next(layer.out_features for layer in model.net if isinstance(layer, torch.nn.Linear))
+    dropout = next((layer.p for layer in model.net if isinstance(layer, torch.nn.Dropout)), None)
     with open(config_path, "w", encoding="utf-8") as file:
         json.dump(
             {
                 "n_features": n_features,
-                "hidden_width": 512,
-                "dropout": 0.3,
+                "hidden_width": hidden_width,
+                "dropout": dropout,
                 "feature_names": dataset.feature_names,
             },
             file,

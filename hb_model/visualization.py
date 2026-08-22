@@ -43,6 +43,7 @@ def plot_history(history: list[dict[str, float]], test_mae: float, test_rmse: fl
     train_loss = [entry["train_loss"] for entry in history]
     val_mae = [entry["val_mae"] for entry in history]
     val_rmse = [entry["val_rmse"] for entry in history]
+    val_r2 = [entry.get("val_r2", float("nan")) for entry in history]
     learning_rate = [entry["lr"] for entry in history]
 
     # Training loss and validation MAE.
@@ -72,6 +73,21 @@ def plot_history(history: list[dict[str, float]], test_mae: float, test_rmse: fl
     plt.savefig(rmse_path, dpi=130)
     plt.close()
     print(f"validation RMSE plot: {rmse_path}")
+
+    # Validation R2 — the primary explainability metric.
+    plt.figure(figsize=(8, 5))
+    plt.plot(epochs, val_r2, marker="o", markersize=3, color="green", label="Validation R²")
+    plt.axhline(0.0, color="gray", ls="--", lw=1, label="R²=0 (predicts mean)")
+    plt.xlabel("Epoch")
+    plt.ylabel("R²")
+    plt.title("Hb Validation R²")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    r2_path = os.path.join(output_dir, "validation_r2.png")
+    plt.savefig(r2_path, dpi=130)
+    plt.close()
+    print(f"validation R² plot: {r2_path}")
 
     # Learning rate.
     plt.figure(figsize=(8, 5))

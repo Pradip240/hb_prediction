@@ -147,6 +147,7 @@ class HbDataset(Dataset[tuple[Tensor, Tensor]]):
         features_list: list[np.ndarray] = []
         targets_list: list[float] = []
         for sample_index, (path, hemoglobin) in enumerate(self.samples, start=1):
+            print(f"    extracting features: {sample_index}/{len(self.samples)}", flush=True)
             data = np.load(path)
             signals = np.asarray(data["signals"], dtype=np.float32)
             pixel_counts = np.asarray(data["pixel_counts"], dtype=np.float32)
@@ -183,7 +184,6 @@ class HbDataset(Dataset[tuple[Tensor, Tensor]]):
                 )
             features_list.append(features.astype(np.float32))
             targets_list.append(float(hemoglobin))
-            print(f"\r  extracting features: {sample_index}/{len(self.samples)}", end="", flush=True)
 
         print()
         self.features = np.stack(features_list, axis=0).astype(np.float32)
