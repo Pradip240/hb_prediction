@@ -287,7 +287,7 @@ def train(
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
 
-    best_val_mae = float("inf")
+    best_val_r2 = float("-inf")
     best_state: dict[str, torch.Tensor] | None = None
     bad_epochs = 0
     history: list[dict[str, float]] = []
@@ -319,7 +319,9 @@ def train(
 
         train_loss = total_loss / max(1, sample_count)
         val_mae, val_rmse, val_r2, val_corr = evaluate(model, val_loader, device)
-        scheduler.step(val_mae)  # type: ignore
+        # Optimizing for explainability: drive the scheduler on R2, not MAE.
+        # ReduceLROnPlateau expects a quantity to minimize, so negate R2.
+        scheduler.step(-val_r2 if np.isfinite(val_r2) else 0.0)  # type: ignore
         current_lr = float(optimizer.param_groups[0]["lr"])
 
         # Save the history after every epoch so progress is not lost.
@@ -344,9 +346,9 @@ def train(
 
         torch.save(model.state_dict(), last_weights_path)
 
-        # Save a separate checkpoint whenever validation MAE improves.
-        if np.isfinite(val_mae) and val_mae < best_val_mae:
-            best_val_mae = val_mae
+        # Save a separate checkpoint whenever validation R^2 improves.
+        if np.isfinite(val_r2) and val_r2 > best_val_r2:
+            best_val_r2 = val_r2
             bad_epochs = 0
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
             torch.save(best_state, best_weights_path)
@@ -488,7 +490,7 @@ def main() -> None:
     with open(metrics_path, "w", encoding="utf-8") as file:
         json.dump(
             {
-                "best_val_mae": min(entry["val_mae"] for entry in history if np.isfinite(entry["val_mae"])),
+                "best_val_r2": max(entry["val_r2"] for entry in history if np.isfinite(entry["val_r2"])),
                 "test_mae": test_mae,
                 "test_rmse": test_rmse,
                 "test_r2": test_r2,

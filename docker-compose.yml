@@ -92,20 +92,39 @@ services:
   #             "--segments-dir", "/output/dataset", "--manifest", "/output/dataset/segments_manifest.csv",
   #             "--epochs", "120", "--batch-size", "256"]
 
-  rppg_prediction:
+  mlt_training:
     image: rppg-base
-    container_name: rppg-prediction
-    working_dir: /app
+    container_name: mlt-training
     volumes:
       - ./data:/data:ro
       - ./output:/output
       - ./common:/app/common:ro
-      - ./prediction:/app/prediction:ro
-      - ./hr_model:/app/hr_model:ro
-      - ./hb_model:/app/hb_model:ro
-    command: ["python", "-m", "prediction.predict", "--dataset-dir", "/output/dataset", "--ppg-dir", "/data/ppg",
-              "--manifest", "/output/dataset/segments_manifest.csv", "--out-dir", "/output/prediction",
-              "--hr-model", "/output/hr_model", "--hb-model", "/output/hb_model", "--no-plot", "--workers", "1"]
+      - ./multi_task_model:/app/multi_task_model:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: ["python", "-m", "multi_task_model.train", "--out-dir", "/output/multi_task_model",
+              "--segments-dir", "/output/dataset", "--manifest", "/output/dataset/segments_manifest.csv",
+              "--epochs", "120", "--batch-size", "256"]
+
+  # rppg_prediction:
+  #   image: rppg-base
+  #   container_name: rppg-prediction
+  #   working_dir: /app
+  #   volumes:
+  #     - ./data:/data:ro
+  #     - ./output:/output
+  #     - ./common:/app/common:ro
+  #     - ./prediction:/app/prediction:ro
+  #     - ./hr_model:/app/hr_model:ro
+  #     - ./hb_model:/app/hb_model:ro
+  #   command: ["python", "-m", "prediction.predict", "--dataset-dir", "/output/dataset", "--ppg-dir", "/data/ppg",
+  #             "--manifest", "/output/dataset/segments_manifest.csv", "--out-dir", "/output/prediction",
+  #             "--hr-model", "/output/hr_model", "--hb-model", "/output/hb_model", "--no-plot", "--workers", "1"]
 
 #   docker compose run --rm segmentation
 #   docker compose run --rm landmarks
